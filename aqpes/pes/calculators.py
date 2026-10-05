@@ -218,7 +218,9 @@ class PySCFCalculator(Calculator):
     - **SCF 层**: RHF, ROHF, UHF, DFT (RKS/ROKS/UKS)
     - **多参考** (v0.25.0–v0.32.0): CASSCF + **NEVPT2 动态相关**;
       **态平均 CASSCF 激发态** (`state_average=True` + `nstates>1` + `state=k`,
-      自旋纯, 天然抑制态身份漂移) —
+      自旋纯, 天然抑制态身份漂移); **选择组态 CI** (`fci_solver="sci"`) 把活性
+      空间推到稠密 FCI 做不到的规模 (如 CAS(14,14) 的 1.2e7 维, 配
+      `method="casci"` 使用; CASSCF 驱动与 SCI 的 RDM 接口不兼容, 已明确报错) —
       键断裂/强关联/激发态势能面
     - **激发态** (v0.27.0–v0.29.0): TD-DFT/TDHF 与 **EOM-CCSD**; `state=k` 即
       激发态势能面; `follow=True` 启用**根跟踪** (态交叉时保持物理身份)
@@ -248,7 +250,7 @@ class PySCFCalculator(Calculator):
     }
     #: 纯 SCF 方法
     _SCF_ONLY = ("rhf", "rohf", "uhf", "dft", "rks", "roks", "uks", "casscf",
-                 "tddft")
+                 "casci", "tddft")
 
     def __init__(self, symbols: Sequence[str], basis: str = "sto-3g",
                  charge: int = 0, spin: int = 0, method: str = "rhf",
@@ -265,6 +267,10 @@ class PySCFCalculator(Calculator):
                  nstates: int = 5, state: Optional[int] = None,
                  state_weights: Optional[Sequence[float]] = None,
                  state_average: bool = False,
+                 fci_solver: str = "dense",
+                 sci_select_cutoff: float = 1e-6,
+                 sci_ci_coeff_cutoff: float = 1e-8,
+                 spin_pure_fci: Optional[bool] = None,
                  solvent: Optional[str] = None,
                  solvent_eps: Optional[float] = None,
                  solvent_model: str = "ddcosmo",
@@ -315,6 +321,19 @@ class PySCFCalculator(Calculator):
         # 不设开关时保持历史行为 (单态 CASSCF) —— 注意 nstates 的默认值是 5
         # (为 TD-DFT 而设), 若隐式触发会使既有 CASSCF 工作流悄悄变成 5 态平均。
         self.state_average = bool(state_average)
+        # FCI 求解器 (v0.33.0): "dense" (稠密, 默认) | "sci" (选择组态 CI,
+        # 把活性空间推到稠密 FCI 做不到的规模, 如 CAS(14,14) 的 1.2e7 维)
+        self.fci_solver = str(fci_solver).lower()
+        if self.fci_solver not in ("dense", "sci"):
+            raise ValueError(
+                f"未知 fci_solver: {fci_solver!r}; 支持 'dense' 或 'sci'")
+        self.sci_select_cutoff = float(sci_select_cutoff)
+        self.sci_ci_coeff_cutoff = float(sci_ci_coeff_cutoff)
+        # 自旋纯化 (fix_spin_): 避免在给定 M_s 扇区内拿到非目标自旋的根
+        # (实测 H₂ 的第二个根是 ³Σu⁺ 而非第二个单重态)。
+        # None = 自动: 多根/态平均 (nstates>1) 时开启 (必需), 单根时关闭
+        # (保持 v0.25–v0.32 的历史行为, 显式 True 可开启)。
+        self.spin_pure_fci = None if spin_pure_fci is None else bool(spin_pure_fci)
         self.state_weights = (None if state_weights is None
                               else [float(w) for w in state_weights])
         # 激发态根跟踪 (v0.29.0): follow=True 时按与上一几何的激发向量
@@ -433,6 +452,33 @@ class PySCFCalculator(Calculator):
         extra = f"/{self.pcm_variant}" if self.solvent_model == "pcm" else ""
         return f"{self.solvent_model}{extra} (eps={self.solvent_eps})"
 
+    def _make_fci_solver(self, mol, nroots: int = 1):
+        """构造 FCI 求解器: 稠密 (``dense``) 或选择组态 (``sci``, 大活性空间)。
+
+        - ``sci`` 用 ``pyscf.fci.selected_ci.SCI``: 微扰选择阈值
+          (``select_cutoff``) + 系数剪枝 (``ci_coeff_cutoff``) 构筑选择空间,
+          可处理 CAS(14,14) (稠密维数 1.2e7) 这类无法直接对角化的活性空间;
+        - 自旋纯化 (``spin_pure_fci=True``) 装 ``fix_spin_`` (SCI 亦兼容, 实测);
+        - ``nroots`` 须设为**属性**: PySCF 的 CASCI kernel 不向求解器传 nroots。
+        """
+        from pyscf import fci as _fci
+        if self.fci_solver == "sci":
+            from pyscf.fci import selected_ci
+            solver = selected_ci.SCI(mol)
+            solver.select_cutoff = float(self.sci_select_cutoff)
+            solver.ci_coeff_cutoff = float(self.sci_ci_coeff_cutoff)
+            solver.conv_tol = min(float(self.conv_tol), 1e-9)
+            solver.max_cycle = max(200, int(self.max_cycle))
+        else:
+            solver = _fci.direct_spin1.FCI(mol)
+        solver.nroots = int(nroots)
+        spin_pure = (self.spin_pure_fci if self.spin_pure_fci is not None
+                     else int(nroots) > 1)
+        if spin_pure:
+            s2 = (abs(self.spin) / 2.0) * (abs(self.spin) / 2.0 + 1.0)
+            _fci.addons.fix_spin_(solver, shift=0.5, ss=s2)
+        return solver
+
     def _pick_casscf_root(self, mc, default_idx: int) -> int:
         """态平均 CASSCF 的根跟踪: 按与上一几何 **CI 向量最大重叠** 选根。
 
@@ -534,8 +580,8 @@ class PySCFCalculator(Calculator):
             mf = dft.UKS(mol)
             if self.xc:
                 mf.xc = self.xc
-        elif m == "casscf":
-            # CASSCF: 先用 RHF/ROHF 参考, 再由 _run 做多组态自洽
+        elif m in ("casscf", "casci"):
+            # CASSCF/CASCI: 先用 RHF/ROHF 参考, 再由 _run 做多组态计算
             mf = scf.RHF(mol) if self.spin == 0 else scf.ROHF(mol)
         elif m == "tddft":
             # TD-DFT/TDHF: xc 给定 → RKS 参考 + TDDFT; 否则 RHF + TDHF
@@ -692,11 +738,63 @@ class PySCFCalculator(Calculator):
                         (2 * self.grad_t_h)
             return e_exc, g
 
+        # ---- CASCI: 固定 (SCF) 轨道上的多组态 CI (v0.33.0) ----
+        # 用途: (a) 传统 CASCI 单点; (b) **大活性空间**: 配 fci_solver="sci"
+        # 可处理 CAS(14,14) (稠密维数 1.2e7) 这类 CASSCF/dense 无法胜任的空间。
+        # 无轨道优化 → 无解析梯度 (FD)。
+        if self.method == "casci":
+            if not self.active_space:
+                raise CommandBackendError(
+                    'method="casci" 需要 active_space=(ncas, nelecas)')
+            from pyscf import mcscf
+            ncas, nelecas = self.active_space
+            # 根数语义与态平均 CASSCF 一致: 仅在用户**显式**要多个态
+            # (state=k 或 state_average=True) 时按 nstates 计算多根;
+            # 否则单根 (避免 nstates 的 TD-DFT 默认值 5 被静默带入)。
+            want_states = (self.state is not None) or bool(self.state_average)
+            nst = max(1, int(self.nstates)) if want_states else 1
+            mc = mcscf.CASCI(mf, int(ncas), int(nelecas))
+            mc.verbose = 0
+            mc.fcisolver = self._make_fci_solver(mf.mol, nst)
+            res = mc.kernel()
+            e_tot = np.atleast_1d(np.asarray(res[0], dtype=float)).ravel()
+            if nst > 1:
+                self.last_state_energies = e_tot
+            idx = 0
+            if self.state is not None:
+                if not (0 <= self.state < e_tot.size):
+                    raise CommandBackendError(
+                        f"state={self.state} 超出范围 (共 {e_tot.size} 个根); "
+                        '需 nstates>1 才有多个根')
+                idx = int(self.state)
+            e = float(e_tot[idx])
+            self._last_solver = mc
+            if not need_grad:
+                return e, None
+            # CASCI (固定轨道) 无轨道响应 → 中心有限差分
+            g = np.zeros_like(coords_arr)
+            for i in range(coords_arr.shape[0]):
+                for j in range(3):
+                    cp, cm = coords_arr.copy(), coords_arr.copy()
+                    cp[i, j] += self.grad_t_h
+                    cm[i, j] -= self.grad_t_h
+                    g[i, j] = (self._energy_only(cp) - self._energy_only(cm)) / \
+                        (2 * self.grad_t_h)
+            return e, g
+
         # ---- CASSCF: 多组态自洽场 (静态相关 / 键断裂) ----
         if self.method == "casscf":
             if not self.active_space:
                 raise CommandBackendError(
                     'method="casscf" 需要 active_space=(ncas, nelecas)')
+            if self.fci_solver == "sci":
+                raise CommandBackendError(
+                    'method="casscf" 不支持 fci_solver="sci": PySCF 的 CASSCF '
+                    "驱动会调用求解器的 make_rdm1/contract_ss, 而 selected_ci.SCI "
+                    "的 CI 对象是 (civec, ci_strs) 扩展形式 (实测 "
+                    'cannot unpack non-iterable NoneType) → 大活性空间请用 '
+                    'method="casci" (SCF 轨道上的 CASCI + SCI)'
+                )
             from pyscf import mcscf
             ncas, nelecas = self.active_space
             mc = mcscf.CASSCF(mf, int(ncas), int(nelecas))
@@ -707,8 +805,6 @@ class PySCFCalculator(Calculator):
             # state_average_(等权或给定权重)。态平均轨道的**共同**轨道基使各态
             # 能量随几何**平滑**变化 —— 态交叉处"态身份漂移"的标准解法
             # (优于事后根跟踪启发式)。
-            from pyscf import fci as _fci
-            s2_t = (abs(self.spin) / 2.0) * (abs(self.spin) / 2.0 + 1.0)
             if sa:
                 w = (list(self.state_weights) if self.state_weights is not None
                      else [1.0 / nst] * nst)
@@ -718,11 +814,10 @@ class PySCFCalculator(Calculator):
                 # ⚠ 必须用**自旋纯**求解器: PySCF 默认 direct_spin1 返回该 M_s
                 # 扇区内能量最低的根 (不分自旋) —— 例如 H₂ 会先给出 ³Σu⁺ 而
                 # 不是第二个单重态 (实测: E1 = −0.5318 vs FCI 单重态 −0.1693)。
-                solver = _fci.direct_spin1.FCI(mf.mol)
-                solver.nroots = nst
-                _fci.addons.fix_spin_(solver, shift=0.5, ss=s2_t)
-                mc.fcisolver = solver
+                mc.fcisolver = self._make_fci_solver(mf.mol, nst)
                 mc = mcscf.state_average_(mc, w)
+            else:
+                mc.fcisolver = self._make_fci_solver(mf.mol, 1)
             mc.conv_tol = max(self.conv_tol, 1e-8)
             mc.max_cycle = self.max_cycle
             mc.kernel()
@@ -763,10 +858,7 @@ class PySCFCalculator(Calculator):
                     from pyscf import mcscf as _mcscf
                     mc_ci = _mcscf.CASCI(mf, int(ncas), int(nelecas))
                     mc_ci.verbose = 0
-                    sc = _fci.direct_spin1.FCI(mf.mol)
-                    sc.nroots = nst
-                    _fci.addons.fix_spin_(sc, shift=0.5, ss=s2_t)
-                    mc_ci.fcisolver = sc
+                    mc_ci.fcisolver = self._make_fci_solver(mf.mol, nst)
                     mc_ci.kernel(mc.mo_coeff)
                     e_pt2 = float(mrpt.NEVPT(mc_ci, root=idx).kernel())
                 else:
@@ -1068,9 +1160,18 @@ class PySCFCalculator(Calculator):
             "spin_lock": str(self.spin_lock),
             "use_mom": str(self.use_mom),
             "frozen_core": str(self.frozen_core),
+            "fci_solver": (self.fci_solver
+                           if self.method in ("casscf", "casci") else "n/a"),
+            "sci_cutoffs": ((f"select={self.sci_select_cutoff:g}, "
+                             f"coeff={self.sci_ci_coeff_cutoff:g}")
+                            if (self.method in ("casscf", "casci")
+                                and self.fci_solver == "sci") else "n/a"),
+            "spin_pure_fci": str(self.spin_pure_fci),
             "relativistic": str(self.relativistic or "none"),
             "active_space": (f"({self.active_space[0]},{self.active_space[1]})"
                              if self.active_space else "n/a"),
+            "nstates_casci": (str(self.nstates)
+                              if self.method == "casci" else "n/a"),
             "pt2": str(self.pt2 or "none"),
             "solvent": self._solvent_desc(),
             "nstates": (str(self.nstates)

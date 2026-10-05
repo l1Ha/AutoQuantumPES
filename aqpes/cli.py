@@ -58,7 +58,7 @@ def main():
     sample_parser.add_argument("--spin", type=int, default=None,
                                help="自旋参数 2S = Na - Nb (pyscf, 缺省与 --uhf 保持一致)")
     sample_parser.add_argument("--method", default="rhf",
-                               help="电子结构方法: rhf, uhf, rohf, dft, rks, roks, uks (pyscf)")
+                               help="电子结构方法: rhf/uhf/rohf/dft/rks/roks/uks/mp2/ccsd/ccsd(t)/casscf/casci/tddft/eom-ccsd (pyscf)")
     sample_parser.add_argument("--basis", default="sto-3g",
                                help="基组 (pyscf, 默认 sto-3g)")
     sample_parser.add_argument("--xc", default=None,
@@ -176,6 +176,14 @@ def _add_casscf_args(p):
                    help="CASSCF 活性空间 (轨道数 电子数), 如 --active-space 4 4")
     p.add_argument("--pt2", default=None, choices=["nevpt2"],
                    help="CASSCF 之上的动态相关 (NEVPT2; PySCF 无 CASPT2)")
+    p.add_argument("--fci-solver", default="dense", choices=["dense", "sci"],
+                   help="FCI 求解器: dense (默认) 或 sci (选择组态, 大活性空间)")
+    p.add_argument("--sci-select-cutoff", type=float, default=1e-6,
+                   help="SCI 微扰选择阈值 (越小越准/越慢; 默认 1e-6)")
+    p.add_argument("--sci-ci-coeff-cutoff", type=float, default=1e-8,
+                   help="SCI 系数剪枝阈值 (默认 1e-8)")
+    p.add_argument("--no-spin-pure-fci", action="store_true",
+                   help="关闭 FCI 自旋纯化 (默认开启 fix_spin_)")
     p.add_argument("--nstates", type=int, default=None,
                    help="态平均态数 (>1 启用态平均 CASSCF 激发态势能面)")
     p.add_argument("--state", type=int, default=None,
@@ -203,6 +211,14 @@ def _casscf_kwargs(args):
         out["state"] = args.state
     if getattr(args, "state_weights", None):
         out["state_weights"] = tuple(args.state_weights)
+    if getattr(args, "fci_solver", None):
+        out["fci_solver"] = args.fci_solver
+    if getattr(args, "sci_select_cutoff", None) is not None:
+        out["sci_select_cutoff"] = args.sci_select_cutoff
+    if getattr(args, "sci_ci_coeff_cutoff", None) is not None:
+        out["sci_ci_coeff_cutoff"] = args.sci_ci_coeff_cutoff
+    if getattr(args, "no_spin_pure_fci", False):
+        out["spin_pure_fci"] = False
     if getattr(args, "follow", False):
         out["follow"] = True
     return out

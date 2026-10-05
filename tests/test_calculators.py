@@ -483,6 +483,121 @@ class TestSACASSCFMock(unittest.TestCase):
             self.assertTrue(calc.follow)        # follow 标志已恢复
 
 
+class TestSelectedCIMock(unittest.TestCase):
+    """选择组态 CI (fci_solver="sci", v0.33.0) 的分发与参数落到求解器上。"""
+
+    def _mods(self):
+        import sys
+        from unittest.mock import MagicMock
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_mcscf = MagicMock()
+        mock_fci = MagicMock()
+        mock_fci.addons = MagicMock()
+        mock_sci_mod = MagicMock()
+        mock_fci.selected_ci = mock_sci_mod
+        mock_solvent = MagicMock()
+        mock_pyscf.mcscf = mock_mcscf
+        mock_pyscf.fci = mock_fci
+        mock_pyscf.solvent = mock_solvent
+        mods.update({"pyscf.mcscf": mock_mcscf, "pyscf.fci": mock_fci,
+                     "pyscf.fci.addons": mock_fci.addons,
+                     "pyscf.fci.selected_ci": mock_sci_mod,
+                     "pyscf.solvent": mock_solvent})
+        return mods, mock_pyscf, mock_mcscf, mock_sci_mod, mock_fci
+
+    def _wire(self, mock_pyscf, mock_mcscf):
+        from unittest.mock import MagicMock
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        mf = MagicMock()
+        mf.converged = True
+        mf.kernel.return_value = -107.0
+        mf.mo_coeff = np.eye(6)
+        mf.mo_occ = np.array([2., 2., 2., 0., 0., 0.])
+        mf.mol = MagicMock()
+        mock_pyscf.scf.RHF.return_value = mf
+        mc = MagicMock()
+        mc.converged = True
+        mc.kernel.return_value = (-107.1, None)
+        mc.e_tot = -107.1
+        mc.e_states = np.array([-107.1, -107.05])
+        mc.ci = None
+        mock_mcscf.CASSCF.return_value = mc
+        mock_mcscf.CASCI.return_value = mc
+        mock_mcscf.state_average_.return_value = mc
+        return mc
+
+    def test_sci_solver_constructed_with_cutoffs(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, mock_sci_mod, mock_fci = self._mods()
+        self._wire(mock_pyscf, mock_mcscf)
+        with patch.dict(sys.modules, mods):
+            # 大活性空间走 method="casci" (CASSCF 驱动与 SCI 的 RDM 接口不兼容)
+            calc = make_calculator("pyscf", symbols=["N", "N"], method="casci",
+                                   active_space=(6, 6), fci_solver="sci",
+                                   sci_select_cutoff=1e-7,
+                                   sci_ci_coeff_cutoff=1e-9)
+            e = calc.energy(np.array([[0., 0., 0.], [0., 0., 2.1]]))
+            self.assertAlmostEqual(e, -107.1)
+            mock_sci_mod.SCI.assert_called_once()
+            solver = mock_sci_mod.SCI.return_value
+            self.assertAlmostEqual(solver.select_cutoff, 1e-7)
+            self.assertAlmostEqual(solver.ci_coeff_cutoff, 1e-9)
+            self.assertEqual(solver.nroots, 1)          # nroots 必须设为属性
+            self.assertEqual(calc.provenance["fci_solver"], "sci")
+            self.assertIn("select=1e-07", calc.provenance["sci_cutoffs"])
+
+    def test_dense_default_and_spin_pure_toggle(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, mock_sci_mod, mock_fci = self._mods()
+        self._wire(mock_pyscf, mock_mcscf)
+        with patch.dict(sys.modules, mods):
+            c1 = make_calculator("pyscf", symbols=["N", "N"], method="casscf",
+                                 active_space=(6, 6))
+            c1.energy(np.array([[0., 0., 0.], [0., 0., 2.1]]))
+            mock_sci_mod.SCI.assert_not_called()             # 默认稠密
+            mock_fci.direct_spin1.FCI.assert_called_once()
+            # 单根默认**不**自旋纯化 (保持 v0.25–v0.32 历史行为)
+            mock_fci.addons.fix_spin_.assert_not_called()
+        for kw, expect in ((dict(spin_pure_fci=True), True),
+                           (dict(nstates=2, state_average=True), True),
+                           (dict(spin_pure_fci=False), False)):
+            mods2, mock_pyscf2, mock_mcscf2, _, mock_fci2 = self._mods()
+            self._wire(mock_pyscf2, mock_mcscf2)
+            with patch.dict(sys.modules, mods2):
+                c2 = make_calculator("pyscf", symbols=["N", "N"],
+                                     method="casscf", active_space=(6, 6), **kw)
+                c2.energy(np.array([[0., 0., 0.], [0., 0., 2.1]]))
+                if expect:
+                    self.assertTrue(mock_fci2.addons.fix_spin_.called, kw)
+                else:
+                    mock_fci2.addons.fix_spin_.assert_not_called()
+
+    def test_casscf_with_sci_rejected(self):
+        """CASSCF 驱动与 SCI 的 RDM 接口不兼容 → 必须明确报错并指向 casci。"""
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, mock_sci_mod, _ = self._mods()
+        self._wire(mock_pyscf, mock_mcscf)
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["N", "N"], method="casscf",
+                                   active_space=(6, 6), fci_solver="sci")
+            with self.assertRaises(CommandBackendError) as ctx:
+                calc.energy(np.array([[0., 0., 0.], [0., 0., 2.1]]))
+            self.assertIn("casci", str(ctx.exception))
+
+    def test_invalid_fci_solver_rejected(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        with patch.dict(sys.modules, mods):
+            with self.assertRaises(ValueError):
+                make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                active_space=(2, 2), fci_solver="hci")
+
+
 if __name__ == "__main__":
     unittest.main()
 
