@@ -143,7 +143,7 @@ def environment_info() -> Dict[str, Any]:
         pass
     try:
         from aqpes import __version__ as aq_version
-        info["aqpes"] = aq_version
+        info["autoquantum"] = aq_version
     except Exception:
         pass
     try:

@@ -5,8 +5,8 @@
 三层接口
 --------
 1. **积分层**: :func:`soc_integrals` / :func:`soc_integrals_mo`
-   逐原子构造 (l 与 r³ 均相对该原子), 含 α²/2 前置因子, 单位为 Hartree。
-   因为每个原子用自己的 l_A/r_A³, 结果与坐标原点选择无关 (验证脚本检验)。
+   逐原子构造 (l 与 r³ 均相对该原子, 用 ``with_rinv_at_nucleus``), 含 α²/2
+   前置因子, 单位为 Hartree。结果与分子在空间中的位置无关 (验证脚本检验)。
 2. **轨道层**: :func:`soc_zeta` → 轨道型 SOC 常数 ζ (cm⁻¹)。
    在 p/π 子空间内对 h_z 求本征值, ζ = max|λ| (与轨道相位/任意混合无关)。
    精细结构分裂 (由 L·S 耦合推出, 见 `splitting_atomic_p`/`splitting_pi`):
@@ -38,6 +38,7 @@ PREF = ALPHA ** 2 / 2.0
 
 __all__ = [
     "ALPHA", "AU2CM", "PREF",
+    "axis_angular_momentum",
     "soc_integrals", "soc_integrals_mo", "soc_zeta",
     "splitting_atomic_p", "splitting_pi",
     "trans_density_1body", "soc_matrix_states",
@@ -69,10 +70,22 @@ def soc_integrals(mol, z_eff: Optional[Dict[str, float]] = None) -> np.ndarray:
         z = float(z_eff[sym]) if (z_eff and sym in z_eff) else mol.atom_charge(ia)
         if z == 0.0:
             continue
-        # common-origin 技巧: 原点取在该原子上 ⇒ 得到 Z_A (l_A/r_A³)
-        with mol.with_common_origin(mol.atom_coord(ia)):
+        # ⚠ 起点约定 (实测踩坑): int1e_prinvxp 的 1/r³ 起点由 **rinv 原点** 控制;
+        # with_common_origin 对该积分**无效** —— 平移分子后结果会漂移
+        # (实测: He⁺ 从原点移到 (3.1,−2.4,5.7) Bohr, ζ 由 3.874 变成 0.005 cm⁻¹)。
+        # 正确做法是把 rinv 原点放到该原子核上。
+        try:
+            ctx = mol.with_rinv_at_nucleus(ia)
+        except AttributeError:                      # 兼容旧版 PySCF
+            ctx = mol.with_rinv_origin(mol.atom_coord(ia))
+        with ctx:
             h += z * np.asarray(mol.intor("int1e_prinvxp", comp=3), dtype=float)
-    return h * PREF
+    # ⚠ 关键约定: libcint 返回 (r×∇) 的**实**矩阵, 而物理角动量 l = −i(r×∇)
+    # → 必须乘 −1j 才得到 Hermitian 的 SOC 单电子算符。
+    # 漏掉该因子会使矩阵变成反 Hermitian (实反对称), 态相互作用层的矩阵元
+    # 在 Hermitian 对称化时被**完全抵消为零** (实测踩过的坑)。
+    # 轨道层的 ζ 只取本征值模, 对该相位因子不敏感, 故此前未暴露。
+    return (-1j * PREF) * h
 
 
 def soc_integrals_mo(mol, mo_coeff, z_eff: Optional[Dict[str, float]] = None
@@ -96,10 +109,10 @@ def soc_zeta(h_mo: np.ndarray, orbitals: Sequence[int]) -> float:
     对角化取 max|λ|。子空间应包含完整 p (3 个) 或 π (2 个) 简并组。
     """
     idx = list(orbitals)
-    blk = np.asarray(h_mo, dtype=float)[2][np.ix_(idx, idx)]
-    m = 1j * blk
-    m = 0.5 * (m + m.conj().T)          # 数值对称化
-    ev = np.linalg.eigvalsh(m)
+    blk = np.asarray(h_mo)[2][np.ix_(idx, idx)]
+    # h_z 在实轨道基下为纯虚反对称 (Hermitian 算符) → 本征值 (0, ±iζ);
+    # 取 |本征值| 最大值即 ζ, 且对"实反对称"表示 (未乘 −i) 同样成立。
+    ev = np.linalg.eigvals(blk)
     return float(np.abs(ev).max() * AU2CM)
 
 
@@ -135,6 +148,54 @@ def _mo_character(mol, mo) -> np.ndarray:
     return m / tot
 
 
+def _is_linear(mol, tol: float = 1e-3) -> bool:
+    """所有原子共线 (容差 Bohr)。"""
+    c = np.asarray(mol.atom_coords(), dtype=float)
+    if len(c) < 3:
+        return True
+    v = c[-1] - c[0]
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return False
+    v = v / n
+    rel = c - c[0]
+    perp = rel - np.outer(rel @ v, v)
+    return bool(np.abs(perp).max() < tol)
+
+
+def axis_angular_momentum(mol, mo, origin=None) -> np.ndarray:
+    """MO 基下沿分子轴 (首-末原子连线) 的角动量矩阵 ``L_axis``。
+
+    用于线性分子的 π/σ 判别: 对 π 轨道 (|Λ|=1) 与 σ 轨道 (Λ=0) 构成的
+    2×2 块, ``1j * L_axis`` 的本征值模 = |Λ| (与相位/实轨道混合无关)。
+    """
+    c = np.asarray(mol.atom_coords(), dtype=float)
+    if len(c) < 2:
+        raise ValueError("单原子无分子轴, 无法用轴向角动量判别")
+    v = c[-1] - c[0]
+    v = v / np.linalg.norm(v)
+    o = c[0] if origin is None else np.asarray(origin, dtype=float)
+    # int1e_rxp / int1e_cg_irxp 用 common origin; 该算符无 1/r 项,
+    # 但为稳妥同时在 rinv 原点上也设一次 (对无 1/r 的算符无影响)。
+    try:
+        cm = mol.with_common_origin(o)
+    except AttributeError:
+        cm = mol.with_common_orig(o)
+    with cm:
+        rxp = np.asarray(mol.intor("int1e_cg_irxp", comp=3), dtype=float)
+    l_ao = np.einsum("k,kpq->pq", v, rxp)
+    mo = np.asarray(mo)
+    # 同 soc_integrals: libcint 给实矩阵, 物理 L = −i(r×∇)
+    return -1j * (mo.T @ l_ao @ mo)
+
+
+def _lambda_abs(l_axis: np.ndarray, idx) -> float:
+    """子空间角动量本征值模 (π → ≈1, σ → ≈0; 与相位/实虚表示无关)。"""
+    idx = list(idx)
+    blk = np.asarray(l_axis)[np.ix_(idx, idx)]
+    return float(np.abs(np.linalg.eigvals(blk)).max())
+
+
 def auto_soc_orbitals(mol, mf, tol: float = 1e-4, n_take: int = 3
                       ) -> List[int]:
     """自动选取 p/π 壳层轨道 (原子 ²P 取 3 个; 线性分子 ²Π 取 2 个)。
@@ -162,10 +223,32 @@ def auto_soc_orbitals(mol, mf, tol: float = 1e-4, n_take: int = 3
     pchar = np.array([float(((mo[:, i] ** 2) * ao_l).sum()
                             / max((mo[:, i] ** 2).sum(), 1e-30))
                       for i in range(nmo)])
+    part = [i for i in range(nmo) if 0.0 < occ[i] < 2.0]
+    # --- 线性分子: 用轴向角动量 |Λ| 判别 π (1) vs σ (0) ---
+    # 注: 必须先于 "占据 p 型轨道 ≥3 取最高 3 个" 的原子分支, 否则 OH 这类
+    # σ+π 开壳层会错配成 (σ, π) 对 (实测 ζ 变成 σ–π 矩阵元, 假值)。
+    if part and mol.natm > 1 and _is_linear(mol):
+        frontier = max(part, key=lambda i: e[i])
+        try:
+            l_axis = axis_angular_momentum(mol, mo)
+        except Exception:
+            l_axis = None
+        if l_axis is not None:
+            lam0 = _lambda_abs(l_axis, [frontier])
+            if lam0 < 0.3:                       # 前沿为 π 型 → 找同 |Λ| 伙伴
+                cand = []
+                for j in range(nmo):
+                    if j == frontier:
+                        continue
+                    lam = _lambda_abs(l_axis, [frontier, j])
+                    if lam > 0.7:
+                        cand.append((abs(e[j] - e[frontier]), j, lam))
+                if cand:
+                    cand.sort()
+                    return sorted([frontier, cand[0][1]])
     ptype_occ = [i for i in range(nmo) if pchar[i] > 0.8 and occ[i] > 1e-6]
     if len(ptype_occ) >= 3:
         return sorted(sorted(ptype_occ, key=lambda i: e[i])[-3:])
-    part = [i for i in range(nmo) if 0.0 < occ[i] < 2.0]
     if not part:
         raise ValueError("无部分占据轨道且占据 p 型轨道 <3: 无法自动定位 p/π 壳层; "
                          "请显式给出 orbitals=[...]")
@@ -333,7 +416,7 @@ def soc_matrix_states(h_mo: np.ndarray, states: List[dict]) -> np.ndarray:
     """
     n = len(states)
     out = np.zeros((n, n), dtype=complex)
-    hx, hy, hz = (np.asarray(h_mo, dtype=float)[k] for k in range(3))
+    hx, hy, hz = (np.asarray(h_mo)[k] for k in range(3))   # 保留复型 (勿转 float)
     hxy_m = 0.5 * (hx - 1j * hy)
     hxy_p = 0.5 * (hx + 1j * hy)
     for i in range(n):
@@ -351,7 +434,7 @@ def soc_matrix_states(h_mo: np.ndarray, states: List[dict]) -> np.ndarray:
             if nik == njk:
                 daa = trans_density_1body("aa", ci, cj, ncas, nik)
                 dbb = trans_density_1body("bb", ci, cj, ncas, nik)
-                val += float(np.sum(hz * (0.5 * (daa - dbb))))
+                val += complex(np.sum(hz * (0.5 * (daa - dbb))))
             # 自旋翻转: bra 的 (na,nb) 比 ket 多 (1,−1) → D^{ab}
             if nik == (njk[0] + 1, njk[1] - 1):
                 dab = trans_density_1body("ab", ci, cj, ncas, njk)
@@ -391,114 +474,58 @@ def spin_pure_solver(ss: float, nroots: int, norb: int):
 
 def casci_ci_vectors(mf, mo_coeff, ncas: int, nelecas, ss: float = 0.0,
                      nroots: int = 1):
-    """在给定轨道上做 CASCI (自旋纯化), 返回 ``(energies_Ha, [ci...])``。
+    """在给定轨道上做 CASCI, 返回 ``(mc, energies_Ha, [ci...])`` —— **自旋纯**。
 
-    ``nelecas`` 为活性空间电子数 (int ⇒ 由 ss 决定 α/β 分配? 不, 见下):
-    为控制 M_s 分量, 请显式给 ``(na, nb)`` 元组 (如三重态 M=+1: (nα+1, nβ−1))。
+    自旋纯化双保险 (实测教训: 仅靠 ``fix_spin_`` 在部分扇区/初始猜测下会滞留
+    在错误自旋上 —— 例如 CH₂ (1,1) 扇区请求三重态却返回带惩罚的单重态):
+      1. ``fix_spin_`` 惩罚项;
+      2. 按 ``<S²>`` 过滤 (必要时自动扩大 nroots 重求)。
+
+    ``nelecas`` 请显式给 ``(na, nb)`` 元组以控制 M_s 分量 (如三重态 M=+1:
+    (nα+1, nβ−1))。
     """
     from pyscf import mcscf
+    from pyscf.fci import spin_op
+    need = max(1, int(nroots))
     mc = mcscf.CASCI(mf, int(ncas), nelecas)
-    mc.fcisolver = spin_pure_solver(ss, nroots, int(ncas))
     mc.verbose = 0
-    mc.kernel(np.asarray(mo_coeff))
-    e = np.atleast_1d(np.asarray(mc.e_tot, dtype=float)).ravel()
-    # 用 mc.ci (PySCF 存好的收敛 CI), 避免解析 kernel 返回元组 (可能含 MO 系数)
-    raw = mc.ci
-    if isinstance(raw, (list, tuple)):
-        ci = [np.asarray(c) for c in raw]
-    else:
-        a = np.asarray(raw)
-        ci = [a] if a.ndim == 2 else [np.asarray(x) for x in a]
-    ci = [c for c in ci if c.ndim == 2]
-    if not ci:
-        raise RuntimeError(f"无法取得 CASCI 的 CI 矢量 (mc.ci 类型 {type(raw)})")
-    if len(ci) < len(e):
-        ci = ci * len(e)
-    return mc, e, ci
 
+    def _extract(obj):
+        raw = obj.ci
+        if isinstance(raw, (list, tuple)):
+            ci = [np.asarray(c) for c in raw]
+        else:
+            a = np.asarray(raw)
+            ci = [a] if a.ndim == 2 else [np.asarray(x) for x in a]
+        return [c for c in ci if c.ndim == 2]
 
-# ---------------------------------------------------------------------------
-# 4. 高层驱动 (计算器 / CLI 使用)
-# ---------------------------------------------------------------------------
-def soc_orbital_analysis(mol, mf, orbitals: Optional[Sequence[int]] = None,
-                         z_eff: Optional[Dict[str, float]] = None,
-                         n_take: int = 3, term: Optional[str] = None) -> dict:
-    """轨道层 SOC 分析: ζ 与精细结构分裂 (cm⁻¹)。
-
-    ``term``: ``None``/``"auto"`` (按轨道数: 3→²P, 2→²Π) | ``"P"`` | ``"Pi"``。
-    返回 ``{"zeta_cm", "splitting_cm", "orbitals", "term", "h_mo"}``。
-    """
-    h_mo = soc_integrals_mo(mol, mf.mo_coeff, z_eff)
-    orb = (list(orbitals) if orbitals is not None
-           else auto_soc_orbitals(mol, mf, n_take=n_take))
-    zeta = soc_zeta(h_mo, orb)
-    t = term or "auto"
-    if t == "auto":
-        t = "P" if len(orb) >= 3 else "Pi"
-    if t == "P":
-        split = splitting_atomic_p(zeta)
-    elif t in ("Pi", "Π"):
-        t = "Pi"
-        split = splitting_pi(zeta)
-    else:
-        raise ValueError(f"未知 term: {term!r}; 用 'auto'/'P'/'Pi'")
-    return {"zeta_cm": zeta, "splitting_cm": split, "orbitals": orb,
-            "term": t, "h_mo": h_mo}
-
-
-def infer_nelecas(mf, active_orbitals: Sequence[int]) -> int:
-    """由 SCF 占据推断活性空间电子数: N_elec − 2×(活性窗口以下的双占据数)。
-
-    适用: 活性轨道为前沿开壳层/π 壳层 (如 CH₂ 的 (a1,b1) 对 → 2; OH 的 π 对 → 3)。
-    """
-    occ = np.asarray(mf.mo_occ, dtype=float).ravel()
-    lo = int(min(active_orbitals))
-    ncore = int(np.sum(occ[:lo + 1] > 1.5))
-    return int(mf.mol.nelectron - 2 * ncore)
-
-
-def soc_state_interaction(mol, mf, active_orbitals: Sequence[int],
-                          singlet_roots: int = 1, triplet_roots: int = 1,
-                          z_eff: Optional[Dict[str, float]] = None,
-                          nelecas: Optional[int] = None) -> dict:
-    """态相互作用 SOC: 单重态-三重态耦合矩阵 (cm⁻¹)。
-
-    共同轨道基 = SCF 轨道; 活性空间 = ``active_orbitals`` (经 ``mcscf.sort_mo``
-    排到活性块)。三重态取 M = +1, 0, −1 三个分量。
-    返回 ``{"energies_cm", "soc_cm", "labels", "za", "zb", "nelecas"}``。
-    """
-    from pyscf import mcscf
-    ncas = len(active_orbitals)
-    nel = infer_nelecas(mf, active_orbitals) if nelecas is None else int(nelecas)
-    na, nb = nel // 2, nel - nel // 2
-    mc = mcscf.CASCI(mf, ncas, (na, nb))
-    mc.verbose = 0
-    mo = mcscf.sort_mo(mc, mf.mo_coeff, list(active_orbitals), base=0)
-    # 活性块积分在**未排序** MO 基上取: sort_mo 只是把活性列搬到活性位置,
-    # 用原索引在排序后的基上取块会取到错误的轨道 (对称性禁阻 → 耦合假零)。
-    h_all = soc_integrals_mo(mol, mf.mo_coeff)
-    idx = list(active_orbitals)
-    h_act = h_all[:, idx, :][:, :, idx]
-    states, labels, energies = [], [], []
-    # 单重态 (M=0)
-    _, es, cis = casci_ci_vectors(mf, mo, ncas, (na, nb), ss=0.0,
-                                  nroots=max(1, int(singlet_roots)))
-    for k in range(min(singlet_roots, len(cis))):
-        states.append({"ci": cis[k], "nelec": (na, nb)})
-        labels.append(f"1({k})")
-        energies.append(es[k])
-    # 三重态 M = +1, 0, −1
-    for mlabel, nsl in (("+1", (na + 1, nb - 1)), ("0", (na, nb)),
-                        ("-1", (na - 1, nb + 1))):
-        if nsl[0] < 0 or nsl[1] < 0:
+    last_err = None
+    for n_r in (need, max(4 * need, 8), max(16 * need, 24)):
+        mc.fcisolver = spin_pure_solver(ss, n_r, int(ncas))
+        mc.kernel(np.asarray(mo_coeff))
+        e = np.atleast_1d(np.asarray(mc.e_tot, dtype=float)).ravel()
+        ci = _extract(mc)
+        if not ci:
+            last_err = "mc.ci 为空"
             continue
-        _, et, cit = casci_ci_vectors(mf, mo, ncas, nsl, ss=2.0,
-                                      nroots=max(1, int(triplet_roots)))
-        for k in range(min(triplet_roots, len(cit))):
-            states.append({"ci": cit[k], "nelec": nsl})
-            labels.append(f"3M{mlabel}({k})")
-            energies.append(et[k])
-    H = soc_matrix_states(h_act, states)
-    e_cm = (np.asarray(energies) - np.min(energies)) * AU2CM
-    return {"energies_cm": e_cm, "soc_cm": H, "labels": labels,
-            "za": na, "zb": nb, "nelecas": nel}
+        s2 = []
+        for c in ci:
+            try:
+                s2.append(float(spin_op.spin_square(c, int(ncas), nelecas)[0]))
+            except Exception:
+                s2.append(float("nan"))
+        if ss >= 0:
+            keep = [k for k, v in enumerate(s2) if abs(v - ss) < 0.1]
+        else:
+            keep = list(range(len(ci)))
+        if len(keep) >= need:
+            ci = [ci[k] for k in keep[:need]]
+            e = np.asarray([e[k] for k in keep[:need]], dtype=float)
+            return mc, e, ci
+        if keep:                                  # 数量不足但至少有纯态 → 返回
+            ci = [ci[k] for k in keep]
+            e = np.asarray([e[k] for k in keep], dtype=float)
+            return mc, e, ci
+        last_err = f"<S²> = {np.round(s2, 4).tolist()} 均不匹配目标 S(S+1)={ss}"
+    raise RuntimeError(
+        f"CASCI 自旋纯化失败 (nelec={nelecas}, 目标 S(S+1)={ss}): {last_err}")

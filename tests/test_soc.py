@@ -101,18 +101,19 @@ class TestSocConstants(unittest.TestCase):
         one = np.ones((3, 2, 2))
         mol.intor.side_effect = lambda name, comp=None: one
         out = S.soc_integrals(mol)
-        # (1 + 9) × ones × α²/2
-        np.testing.assert_allclose(out, 10.0 * S.PREF * one)
-        # common origin 必须逐原子设置
-        self.assertEqual(mol.with_common_origin.call_count, 2)
+        # (1 + 9) × ones × α²/2 × (−i)  [物理 l = −i(r×∇)]
+        np.testing.assert_allclose(out, -1j * 10.0 * S.PREF * one)
+        # rinv 原点必须逐原子设置 (int1e_prinvxp 的 1/r³ 起点; 实测
+        # with_common_origin 对该积分无效, 会使结果随分子平移漂移)
+        self.assertEqual(mol.with_rinv_at_nucleus.call_count, 2)
         # z_eff 覆盖 F 的有效核电荷
         out2 = S.soc_integrals(mol, z_eff={"F": 2.0})
-        np.testing.assert_allclose(out2, 3.0 * S.PREF * one)
+        np.testing.assert_allclose(out2, -1j * 3.0 * S.PREF * one)
         # 零电荷原子被跳过
         mol.atom_charge.side_effect = lambda i: (1.0, 0.0)[i]
-        mol.with_common_origin.reset_mock()
+        mol.with_rinv_at_nucleus.reset_mock()
         S.soc_integrals(mol)
-        self.assertEqual(mol.with_common_origin.call_count, 1)
+        self.assertEqual(mol.with_rinv_at_nucleus.call_count, 1)
 
 
 class TestTransitionDensity(unittest.TestCase):
