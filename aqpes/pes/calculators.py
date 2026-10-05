@@ -15,8 +15,8 @@ Hartree/Bohr), 并提供:
 其数据只应被视为"与该程序设置一致的标签"。可复现性依赖完整的
 程序版本与参数记录 (见 ``provenance``)。
 
-单位约定: 坐标 Bohr, 能量 Hartree, 梯度 Hartree/Bohr —— 与动力学
-模块一致, 无需换算。
+单位约定: 坐标 Bohr, 能量 Hartree, 梯度 Hartree/Bohr (全程原子单位,
+不引入 eV/Å 等换算层, 避免数据集与拟合面之间出现单位漂移)。
 """
 
 from __future__ import annotations

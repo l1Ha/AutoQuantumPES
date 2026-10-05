@@ -1,11 +1,10 @@
 # AutoQuantumPES — 势能面计算与拟合工具包
 
-从 [AutoQuantumDynamics](https://github.com/l1Ha/AutoQuantumDynamics) 单体仓库
-**单独拆分**出来的势能面 (PES) 子系统：从头算电子结构 → 势能面工作流 →
+势能面 (PES) 从头算计算与机器学习拟合工具包：电子结构 → 势能面工作流 →
 数据集/主动学习 → 神经网络拟合，全部在同一个 API 下完成，并可用 CLI 驱动。
 
-本目录是**自包含**的：不依赖主仓库的动力学 (含时波包/QCT) 与可视化模块，
-可独立安装与使用。
+**自包含、零强制外部依赖**（只需 numpy；PySCF / xTB / ASE 为可选后端），
+`pip install -e .` 即可独立使用。
 
 ```bash
 pip install -e .            # 安装 (aqpes 包 + aqpes 命令)
@@ -20,7 +19,7 @@ aqpes fit --data data.npz -o model.pkl
 AutoQuantumPES/
 ├── aqpes/
 │   ├── cli.py          # 命令行: info/sample/fit/backends/opt/scan/freq/soc
-│   ├── core/           # 基础: QuantumSystem/PES/周期表/验证工件 (不含动力学引擎)
+│   ├── core/           # 基础: 体系/势能面容器、周期表常量、验证与可复现性工件
 │   ├── pes/            # 势能面核心
 │   │   ├── calculators.py  # PySCF/xTB/ASE/演示 后端 (约 20 种电子结构方法)
 │   │   ├── abinitio.py     # 数据集容器 + 几何采样 (含主动学习接口)
@@ -40,7 +39,7 @@ AutoQuantumPES/
 │       ├── active_learning.py  # 主动学习闭环
 │       └── dataset.py      # 数据集
 ├── tests/              # 90 项独立单元测试 (pytest/unittest, 无需 PySCF)
-├── validation/         # 服务器 (Slurm) 验证日志归档 —— 见 VALIDATION.md
+├── validation/         # 服务器 (Slurm) 验证日志归档 —— 索引见 VALIDATION.md
 └── tools/sync_from_monorepo.sh   # 与主仓库同步 (拆分的来源与再生成)
 ```
 
@@ -139,15 +138,17 @@ aqpes soc      --input g.xyz --method rohf --basis cc-pvtz [--orbitals 3 4]
 - **无 G4/W1 复合方法**。
 - 显式溶剂 (QM/MM 微溶剂化) 未实现。
 
-## 来源与同步
+## 开发与同步
 
-本目录由主仓库 `AutoQuantumDynamics` 的 `autoquantum/{pes,nn,core子集,cli}` 生成：
+本包的内核代码与上游自研电子结构项目同源；可用脚本从上游仓库重新生成 PES
+子集（import 前缀改写 + 剔除上游专属模块，README/VALIDATION/pyproject 等
+本包自有文件不会被覆盖）：
 
 ```bash
-bash tools/sync_from_monorepo.sh /path/to/AutoQuantumDynamics   # 显式给出主仓库路径
+bash tools/sync_from_upstream.sh /path/to/upstream-repo
 ```
 
-- 版权与许可：见 [LICENSE](LICENSE) (与主仓库一致)。
-- 版本：`aqpes.__version__` 与主仓库对应能力的发布版本一致。
-- 独立仓库: <https://github.com/l1Ha/AutoQuantumPES> (主仓库:
-  <https://github.com/l1Ha/AutoQuantumDynamics>)。
+- 版权与许可：见 [LICENSE](LICENSE)。
+- 版本与变更：见 `aqpes.__version__` 与 [VALIDATION.md](VALIDATION.md)（每次
+  服务器验证后的发布记录）。
+- 仓库：<https://github.com/l1Ha/AutoQuantumPES>

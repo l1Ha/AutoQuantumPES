@@ -1,16 +1,13 @@
-"""输入验证与数值健康诊断 — 科学计算软件的质量底线。
+"""输入验证与可复现性工件 — 科学计算软件的质量底线。
 
-三类检查:
-1. **输入验证** (validate_*): 网格/能量窗/势能值/参数的边界与有限性,
+两类检查:
+1. **输入验证** (``validate_*``): 网格/能量窗/势能值/参数的边界与有限性,
    失败时抛出带可操作提示的 ``ValidationError``;
-2. **传播健康** (PropagationHealth): 波包传播后的守恒、吸收、能量漂移
-   诊断 — 这些是量子动力学结果可信度的第一道闸门;
-3. **步长建议** (suggest_dt): 基于势能幅度与 Nyquist 动能的启发式
-   相位精度上限 (split-operator 无 CFL 限制, 但 dt 过大时相位误差
-   与 CAP 吸收效率都会恶化)。
+2. **可复现性** (``data_fingerprint`` / ``environment_info`` /
+   ``write_run_manifest``): 数据集指纹与运行环境清单, 保证势能面数据与
+   拟合结果可溯源。
 
-设计原则: 验证失败立即报错 (fail fast), 健康检查只告警不中断 —
-物理上可疑但可继续的情形由调用方决定。
+设计原则: 验证失败立即报错 (fail fast)。
 """
 
 from __future__ import annotations
@@ -20,7 +17,6 @@ import json
 import platform
 import subprocess
 import sys
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -110,110 +106,6 @@ def validate_positive(name: str, value: float, allow_zero: bool = False) -> floa
     if v < 0 or (v == 0 and not allow_zero):
         raise ValidationError(f"{name} 必须为正, 收到 {v}")
     return v
-
-
-# ---------------------------------------------------------------------------
-# 传播健康诊断
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PropagationHealth:
-    """波包传播后的可信度诊断。"""
-
-    norm_final: float
-    absorbed_total: float
-    channel_sum: Optional[float]
-    energy_drift_rel: Optional[float] = None
-    nan_detected: bool = False
-    warnings: List[str] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        """诊断是否通过 (无 NaN 且无任何告警)。"""
-        return not self.nan_detected and not self.warnings
-
-    def summary(self) -> str:
-        """单行人可读摘要 (存活概率/吸收量/通道和/能量漂移)。"""
-        parts = [f"norm={self.norm_final:.4f}", f"absorbed={self.absorbed_total:.4f}"]
-        if self.channel_sum is not None:
-            parts.append(f"P_react+P_refl={self.channel_sum:.6f}")
-        if self.energy_drift_rel is not None:
-            parts.append(f"dE/E={self.energy_drift_rel:.2e}")
-        return ", ".join(parts)
-
-
-def check_propagation(result, energy_drift_rel: Optional[float] = None,
-                      residual_tol: float = 1e-6,
-                      unabsorbed_tol: float = 0.05,
-                      drift_tol: float = 1e-3) -> PropagationHealth:
-    """诊断 WavePacket2DResult: NaN/守恒/未吸收比例/能量漂移。
-
-    阈值语义:
-    - ``residual_tol``: |存活 + Σ吸收 − 1| 容差 (记账恒等式);
-    - ``unabsorbed_tol``: 末态网格存活概率上限 — 过大说明传播时长不足
-      或 CAP 太弱, 反应概率会系统性偏低;
-    - ``drift_tol``: ⟨H⟩ 相对漂移上限 (仅在提供时检查)。
-    """
-    norm = np.asarray(result.norm_t, dtype=float)
-    nan = (not np.all(np.isfinite(norm))
-           or not np.all(np.isfinite(result.reaction_prob)))
-    absorbed = float(sum(np.asarray(v)[-1]
-                         for v in result.absorbed.values())) if result.absorbed else 0.0
-    warnings: List[str] = []
-
-    identity = float(norm[-1] + absorbed)
-    if not nan and abs(identity - 1.0) > residual_tol:
-        warnings.append(f"概率记账偏差 {identity - 1.0:+.2e} 超出容差 {residual_tol:.0e}")
-
-    channel_sum = None
-    if result.reaction_prob is not None and result.reflection_prob is not None:
-        channel_sum = float(result.reaction_prob[-1] + result.reflection_prob[-1])
-        if not nan and abs(channel_sum - 1.0) > residual_tol:
-            warnings.append(
-                f"通道和偏离 1 ({channel_sum:.6f}); 检查掩码是否互补划分网格")
-
-    if not nan and norm[-1] > unabsorbed_tol:
-        warnings.append(
-            f"末态仍有 {norm[-1]:.1%} 概率留在网格 (阈值 {unabsorbed_tol:.0%}): "
-            "传播时间不足或 CAP 太弱, 反应概率可能偏低 — 增大 wp_n_steps "
-            "或 cap_height")
-
-    if energy_drift_rel is not None and not nan:
-        if abs(energy_drift_rel) > drift_tol:
-            warnings.append(
-                f"能量相对漂移 {energy_drift_rel:+.2e} 超过 {drift_tol:.0e}: "
-                "减小 dt 或检查势能突变")
-
-    if nan:
-        warnings.append("波函数出现 NaN/Inf: 检查 dt、势能幅度与初始波包")
-
-    return PropagationHealth(
-        norm_final=float(norm[-1]), absorbed_total=absorbed,
-        channel_sum=channel_sum, energy_drift_rel=energy_drift_rel,
-        nan_detected=bool(nan), warnings=warnings)
-
-
-# ---------------------------------------------------------------------------
-# 步长与网格建议
-# ---------------------------------------------------------------------------
-
-def suggest_dt(V: np.ndarray, dR: float, dr: float,
-               mass_R: float, mass_r: float,
-               c: float = 0.5) -> float:
-    """启发式最大步长 (au): 兼顾势能相位与 Nyquist 动能相位精度。
-
-    split-operator 传播无 CFL 限制, 但每步相位增量 Δφ = dt·E 应远
-    小于 1: E_max ≈ max(|V|_max, E_kin(Nyquist))。取 dt ≤ c/E_max。
-    """
-    V = np.asarray(V, dtype=float)
-    v_amp = float(np.max(np.abs(V)))
-    kR = np.pi / abs(float(dR))
-    kr = np.pi / abs(float(dr))
-    e_kin = 0.5 * max(kR ** 2 / mass_R, kr ** 2 / mass_r)
-    e_max = max(v_amp, e_kin)
-    if e_max <= 0:
-        return float("inf")
-    return float(c / e_max)
 
 
 # ---------------------------------------------------------------------------

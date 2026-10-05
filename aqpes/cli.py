@@ -504,7 +504,7 @@ def _show_info(args):
         "features": ["几何优化", "内坐标/松弛扫描", "谐振频率", "CI-NEB 过渡态",
                      "IRC 反应路径", "激发态势能面", "自旋-轨道耦合 (单电子 BP)",
                      "隐式溶剂", "数据集/主动学习", "NN 拟合 (含委员会)"],
-        "scope": "PES 计算与拟合子集 (不含含时波包/QCT 动力学)",
+        "scope": "势能面 (PES) 从头算计算与机器学习拟合",
     }
     print(json.dumps(info, indent=2, ensure_ascii=False))
     return 0

@@ -1,4 +1,4 @@
-from .model import FeedForwardNN, PESNN, nn_pes_2d
+from .model import FeedForwardNN, PESNN
 from .train import NNTrainer, TrainingConfig
 from .dataset import PESDataset
 from .symmetry import SymmetryFunctionSet, SymmetryFunctionParams
