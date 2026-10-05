@@ -176,6 +176,11 @@ def _add_casscf_args(p):
                    help="CASSCF 活性空间 (轨道数 电子数), 如 --active-space 4 4")
     p.add_argument("--pt2", default=None, choices=["nevpt2"],
                    help="CASSCF 之上的动态相关 (NEVPT2; PySCF 无 CASPT2)")
+    p.add_argument("--avas", default=None,
+                   help='AVAS 自动活性空间 (AO 标签, 如 "O 2p; H 1s"); '
+                        "与 --active-space 互斥")
+    p.add_argument("--avas-threshold", type=float, default=0.2,
+                   help="AVAS 占据阈值 (默认 0.2)")
     p.add_argument("--fci-solver", default="dense", choices=["dense", "sci"],
                    help="FCI 求解器: dense (默认) 或 sci (选择组态, 大活性空间)")
     p.add_argument("--sci-select-cutoff", type=float, default=1e-6,
@@ -211,6 +216,9 @@ def _casscf_kwargs(args):
         out["state"] = args.state
     if getattr(args, "state_weights", None):
         out["state_weights"] = tuple(args.state_weights)
+    if getattr(args, "avas", None):
+        out["avas"] = args.avas
+        out["avas_threshold"] = args.avas_threshold
     if getattr(args, "fci_solver", None):
         out["fci_solver"] = args.fci_solver
     if getattr(args, "sci_select_cutoff", None) is not None:

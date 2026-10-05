@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autoquantum-pes"
-version = "0.34.0"
+version = "0.35.0"
 description = "势能面 (PES) 从头算计算与机器学习拟合工具包 (PySCF/xTB/ASE 后端 + 工作流 + NN 拟合)"
 readme = "README.md"
 requires-python = ">=3.9"

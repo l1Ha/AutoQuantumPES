@@ -59,6 +59,7 @@ AutoQuantumPES/
 | ECP / 赝势 | AuH/cc-pVDZ-PP 梯度 vs FD **4.5e-07** |
 | 标量相对论 (X2C) | vs **精确 Dirac 能**: H 0.4%, He⁺ 1.0% |
 | CASSCF 多参考 | H₂ 解离 R=4 Bohr: \|RHF−FCI\| 105.6 mHa → \|CASSCF−FCI\| **0.9 mHa** |
+| **AVAS 自动活性空间** | 由 AO 标签自动构造活性空间; 闭壳层恒等式 **8.5e-14**; N₂ 相关 0.132 Ha; AVAS+CASSCF/态平均/SCI/NEVPT2 全部可叠加; 标签格式实测标定 (列表 ✓ / `;`,`,` ✗ 静默 ncas=0) (Slurm 1559297, 14 s, exit 0) |
 | **复合方法 (CBS + CCSD(T) 加和)** | 三点指数 HF 外推重构误差 **0**; H₂ **R_e = 0.7414 Å (偏差 0.003%)**; H₂O 的 HF/相关两分量 CBS 都优于 cc-pVQZ; 对 CBS 极限偏差 −1.05 mHa (5Z 本身 +0.25 mHa, 变分自洽); **过冲边界如实记录** (Slurm 1559235, 79 s, exit 0) |
 | **CASCI + 选择组态 CI** (大活性空间) | SCI ≡ **稠密 FCI** (CAS(6,6) **1.44e-12**, CAS(8,8) **4.83e-13 Ha**); **CAS(14,14)/cc-pVDZ 稠密 11,778,624 维 → 9 s**; 变分单调收敛 (末两档 0.003 mHa); R_e: CASSCF(8,8) 1.1220 vs CASCI-SCI(14,14) 1.1215 Å (一致 0.0005 Å) (Slurm 1559215, 133 s, exit 0) |
 | **态平均 CASSCF 激发态** + NEVPT2(root) | SA(2) vs **FCI 单重态 8.9e-16**; LiH 避交叉扫描: 无交叉、CI 向量重叠 **0.999895**、ΔE_min 1.5835 eV @ 5.60 Bohr; NEVPT2 对 FCI 拉近 **25.0→9.3 mHa** (Slurm 1559180, 514 s, exit 0) |

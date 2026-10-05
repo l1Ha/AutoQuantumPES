@@ -218,7 +218,8 @@ class PySCFCalculator(Calculator):
     - **SCF 层**: RHF, ROHF, UHF, DFT (RKS/ROKS/UKS)
     - **多参考** (v0.25.0–v0.32.0): CASSCF + **NEVPT2 动态相关**;
       **态平均 CASSCF 激发态** (`state_average=True` + `nstates>1` + `state=k`,
-      自旋纯, 天然抑制态身份漂移); **选择组态 CI** (`fci_solver="sci"`) 把活性
+      自旋纯, 天然抑制态身份漂移); **AVAS 自动活性空间** (`avas="O 2p; H 1s"`, v0.35.0);
+      **选择组态 CI** (`fci_solver="sci"`) 把活性
       空间推到稠密 FCI 做不到的规模 (如 CAS(14,14) 的 1.2e7 维, 配
       `method="casci"` 使用; CASSCF 驱动与 SCI 的 RDM 接口不兼容, 已明确报错) —
       键断裂/强关联/激发态势能面
@@ -267,6 +268,11 @@ class PySCFCalculator(Calculator):
                  nstates: int = 5, state: Optional[int] = None,
                  state_weights: Optional[Sequence[float]] = None,
                  state_average: bool = False,
+                 avas: Optional[str] = None,
+                 avas_threshold: float = 0.2,
+                 avas_minao: str = "minao",
+                 avas_with_iao: bool = False,
+                 avas_openshell_option: int = 2,
                  fci_solver: str = "dense",
                  sci_select_cutoff: float = 1e-6,
                  sci_ci_coeff_cutoff: float = 1e-8,
@@ -323,10 +329,33 @@ class PySCFCalculator(Calculator):
         self.state_average = bool(state_average)
         # FCI 求解器 (v0.33.0): "dense" (稠密, 默认) | "sci" (选择组态 CI,
         # 把活性空间推到稠密 FCI 做不到的规模, 如 CAS(14,14) 的 1.2e7 维)
+        # AVAS (v0.35.0): 从 AO 标签**自动构造活性空间** (主库 pyscf.mcscf.avas)。
+        # 设定后 active_space 由 AVAS 决定 (两者同时给出会明确报错)。
+        # ⚠ 不能 str(list): "['O 2p', ...]" 进正则会 "unterminated character set"
+        # (实测)。列表/元组保留原样, 由 _resolve_active_space 规范化。
+        if avas is None:
+            self.avas = None
+        elif isinstance(avas, (list, tuple)):
+            self.avas = [str(t) for t in avas]
+        else:
+            self.avas = str(avas)
+        self.avas_threshold = float(avas_threshold)
+        self.avas_minao = str(avas_minao)
+        self.avas_with_iao = bool(avas_with_iao)
+        self.avas_openshell_option = int(avas_openshell_option)
+        self._avas_space = None
+        self._avas_meta = None
         self.fci_solver = str(fci_solver).lower()
         if self.fci_solver not in ("dense", "sci"):
             raise ValueError(
                 f"未知 fci_solver: {fci_solver!r}; 支持 'dense' 或 'sci'")
+        if self.avas is not None:
+            if self.active_space:
+                raise ValueError(
+                    "avas 与 active_space 不能同时指定 (AVAS 自动决定活性空间)")
+            if self.method not in ("casscf", "casci"):
+                raise ValueError(
+                    f'method="{self.method}" 不支持 avas; 仅 casscf/casci')
         self.sci_select_cutoff = float(sci_select_cutoff)
         self.sci_ci_coeff_cutoff = float(sci_ci_coeff_cutoff)
         # 自旋纯化 (fix_spin_): 避免在给定 M_s 扇区内拿到非目标自旋的根
@@ -451,6 +480,38 @@ class PySCFCalculator(Calculator):
             return f"smd/{self.solvent} (eps 由 SMD 数据库)"
         extra = f"/{self.pcm_variant}" if self.solvent_model == "pcm" else ""
         return f"{self.solvent_model}{extra} (eps={self.solvent_eps})"
+
+    def _resolve_active_space(self, mf):
+        """返回 ``(ncas, nelecas, mo0)``: AVAS 自动构造或用户指定。
+
+        ``mo0`` 为 AVAS 给出的轨道 (活跃块已排序); 用户显式给 active_space
+        时为 None (沿用 SCF 轨道)。
+        """
+        if self.avas is None:
+            return (int(self.active_space[0]), int(self.active_space[1]), None)
+        from pyscf.mcscf import avas as _avas
+        # 标签规范化: 支持 'O 2p; H 1s' / 'O 2p, H 1s' / ['O 2p', 'H 1s'] 三种写法
+        # (PySCF 的 avas 只认列表或逗号串; 用 ';' 会解析成空目标集 → ncas=0 →
+        #  触发 mcscf 的 "assert ncas > 0", 实测踩过)
+        # 标签规范化 (实测标定): PySCF 的 avas 只接受
+        #   (a) **标签列表** ['O 2p', 'H 1s']  → ncas=6 ✓
+        #   (b) **单标签** 'O 2p' 或正则串 'O 2p|H 1s' → ✓
+        # 而 ';' / ',' 分隔串会**静默返回 ncas=0** (随后触发 mcscf 的
+        # "assert ncas > 0")。故这里统一拆成列表。
+        labels = self.avas
+        if isinstance(labels, (list, tuple)):
+            labels = [str(t).strip() for t in labels]
+        elif isinstance(labels, str):
+            parts = [t.strip() for t in labels.replace(";", ",").split(",")]
+            labels = [t for t in parts if t] if len(parts) > 1 else labels
+        ncas, nelecas, mo = _avas.avas(
+            mf, labels, threshold=self.avas_threshold,
+            minao=self.avas_minao, with_iao=self.avas_with_iao,
+            openshell_option=self.avas_openshell_option, canonicalize=True)
+        self._avas_space = (int(ncas), int(nelecas), mo)
+        self._avas_meta = {"labels": labels, "threshold": self.avas_threshold,
+                           "ncas": int(ncas), "nelecas": int(nelecas)}
+        return (int(ncas), int(nelecas), mo)
 
     def _make_fci_solver(self, mol, nroots: int = 1):
         """构造 FCI 求解器: 稠密 (``dense``) 或选择组态 (``sci``, 大活性空间)。
@@ -743,11 +804,11 @@ class PySCFCalculator(Calculator):
         # 可处理 CAS(14,14) (稠密维数 1.2e7) 这类 CASSCF/dense 无法胜任的空间。
         # 无轨道优化 → 无解析梯度 (FD)。
         if self.method == "casci":
-            if not self.active_space:
+            if not self.active_space and self.avas is None:
                 raise CommandBackendError(
-                    'method="casci" 需要 active_space=(ncas, nelecas)')
+                    'method="casci" 需要 active_space=(ncas, nelecas) 或 avas=...')
             from pyscf import mcscf
-            ncas, nelecas = self.active_space
+            ncas, nelecas, mo0 = self._resolve_active_space(mf)
             # 根数语义与态平均 CASSCF 一致: 仅在用户**显式**要多个态
             # (state=k 或 state_average=True) 时按 nstates 计算多根;
             # 否则单根 (避免 nstates 的 TD-DFT 默认值 5 被静默带入)。
@@ -756,7 +817,7 @@ class PySCFCalculator(Calculator):
             mc = mcscf.CASCI(mf, int(ncas), int(nelecas))
             mc.verbose = 0
             mc.fcisolver = self._make_fci_solver(mf.mol, nst)
-            res = mc.kernel()
+            res = mc.kernel(mo0) if mo0 is not None else mc.kernel()
             e_tot = np.atleast_1d(np.asarray(res[0], dtype=float)).ravel()
             if nst > 1:
                 self.last_state_energies = e_tot
@@ -784,9 +845,9 @@ class PySCFCalculator(Calculator):
 
         # ---- CASSCF: 多组态自洽场 (静态相关 / 键断裂) ----
         if self.method == "casscf":
-            if not self.active_space:
+            if not self.active_space and self.avas is None:
                 raise CommandBackendError(
-                    'method="casscf" 需要 active_space=(ncas, nelecas)')
+                    'method="casscf" 需要 active_space=(ncas, nelecas) 或 avas=...')
             if self.fci_solver == "sci":
                 raise CommandBackendError(
                     'method="casscf" 不支持 fci_solver="sci": PySCF 的 CASSCF '
@@ -796,7 +857,7 @@ class PySCFCalculator(Calculator):
                     'method="casci" (SCF 轨道上的 CASCI + SCI)'
                 )
             from pyscf import mcscf
-            ncas, nelecas = self.active_space
+            ncas, nelecas, mo0 = self._resolve_active_space(mf)
             mc = mcscf.CASSCF(mf, int(ncas), int(nelecas))
             mc = self._attach_solvent(mc, "casscf")
             sa = bool(self.state_average) and int(self.nstates) > 1
@@ -820,7 +881,10 @@ class PySCFCalculator(Calculator):
                 mc.fcisolver = self._make_fci_solver(mf.mol, 1)
             mc.conv_tol = max(self.conv_tol, 1e-8)
             mc.max_cycle = self.max_cycle
-            mc.kernel()
+            if mo0 is not None:
+                mc.kernel(mo0)          # AVAS 轨道作为活性轨道
+            else:
+                mc.kernel()
             if not mc.converged:
                 raise CommandBackendError("CASSCF 未收敛")
             e_states = None
@@ -1170,6 +1234,11 @@ class PySCFCalculator(Calculator):
             "relativistic": str(self.relativistic or "none"),
             "active_space": (f"({self.active_space[0]},{self.active_space[1]})"
                              if self.active_space else "n/a"),
+            "avas": (f"{self._avas_meta['labels']} (thr={self.avas_threshold:g}, "
+                     f"ncas={self._avas_meta['ncas']}, "
+                     f"nelecas={self._avas_meta['nelecas']})"
+                     if self._avas_meta else
+                     ("configured" if self.avas else "none")),
             "nstates_casci": (str(self.nstates)
                               if self.method == "casci" else "n/a"),
             "pt2": str(self.pt2 or "none"),

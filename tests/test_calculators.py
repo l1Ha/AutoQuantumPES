@@ -598,6 +598,118 @@ class TestSelectedCIMock(unittest.TestCase):
                                 active_space=(2, 2), fci_solver="hci")
 
 
+class TestAVASMock(unittest.TestCase):
+    """AVAS 自动活性空间 (v0.35.0): 分发 / 冲突与方法守卫 / 与 SCI 组合。"""
+
+    def _mods(self):
+        import sys
+        from unittest.mock import MagicMock
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_mcscf = MagicMock()
+        mock_avas = MagicMock()
+        mock_mcscf.avas = mock_avas
+        mock_solvent = MagicMock()
+        mock_pyscf.mcscf = mock_mcscf
+        mock_pyscf.solvent = mock_solvent
+        mods.update({"pyscf.mcscf": mock_mcscf,
+                     "pyscf.mcscf.avas": mock_avas,
+                     "pyscf.solvent": mock_solvent})
+        return mods, mock_pyscf, mock_mcscf, mock_avas
+
+    def _wire(self, mock_pyscf, mock_mcscf, mock_avas, ncas=5, nelecas=6):
+        from unittest.mock import MagicMock
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        mf = MagicMock()
+        mf.converged = True
+        mf.kernel.return_value = -76.0
+        mf.mo_coeff = np.eye(24)
+        mf.mo_occ = np.array([2.] * 5 + [0.] * 19)
+        mf.mol = MagicMock()
+        mock_pyscf.scf.RHF.return_value = mf
+        mo_avas = np.eye(24)
+        mock_avas.avas.return_value = (ncas, nelecas, mo_avas)
+        mc = MagicMock()
+        mc.converged = True
+        # CASCI/CASSCF 的 kernel 返回 (能量, ci, ...); 多根时能量为数组
+        mc.kernel.return_value = (np.array([-76.1, -76.0]), None)
+        mc.e_tot = -76.1
+        mc.ci = None
+        mc.e_states = np.array([-76.1, -76.0])
+        mock_mcscf.CASCI.return_value = mc
+        mock_mcscf.CASSCF.return_value = mc
+        mock_mcscf.state_average_.return_value = mc
+        return mc, mf, mo_avas
+
+    def test_avas_dispatch_space_and_kernel_mo(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, mock_avas = self._mods()
+        mc, mf, mo_avas = self._wire(mock_pyscf, mock_mcscf, mock_avas)
+        coords = np.array([[0., 0., 0.], [0., 0., 1.4], [0., 1.0, -0.4]])
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                   basis="cc-pvdz", method="casci",
+                                   avas="O 2p; H 1s", avas_threshold=0.3)
+            e = calc.energy(coords)
+            mock_avas.avas.assert_called_once()
+            args, kwargs = mock_avas.avas.call_args
+            # 标签被规范化为**列表** (PySCF 的 avas 只认列表/单标签/正则串;
+            # ';'/',' 串会静默给 ncas=0, 实测标定)
+            self.assertEqual(args[1], ["O 2p", "H 1s"])
+            self.assertAlmostEqual(kwargs["threshold"], 0.3)
+            # 活性空间必须取自 AVAS 返回值 (ncas=5, nelecas=6)
+            self.assertEqual(mock_mcscf.CASCI.call_args.args[1:], (5, 6))
+            # AVAS 轨道必须传给 kernel
+            mc.kernel.assert_called_once()
+            np.testing.assert_allclose(mc.kernel.call_args.args[0], mo_avas)
+            self.assertAlmostEqual(e, -76.1)
+            prov = calc.provenance["avas"]
+            self.assertIn("O 2p", prov)          # 规范化后的标签列表
+            self.assertIn("H 1s", prov)
+            self.assertIn("ncas=5", prov)
+
+    def test_avas_conflict_and_method_guard(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf, _, _ = self._mods()
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        with patch.dict(sys.modules, mods):
+            # avas 与 active_space 同时给出 → 报错
+            with self.assertRaises(ValueError):
+                make_calculator("pyscf", symbols=["O", "H", "H"],
+                                method="casscf", active_space=(4, 4),
+                                avas="O 2p")
+            # avas 用于非多参考方法 → 报错
+            with self.assertRaises(ValueError):
+                make_calculator("pyscf", symbols=["O", "H", "H"],
+                                method="rhf", avas="O 2p")
+            # 两者都不给 → 原有明确报错
+            calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                   method="casci")
+            with self.assertRaises(CommandBackendError):
+                calc.energy(np.array([[0., 0., 0.], [0., 0., 1.4], [0., 1.0, -0.4]]))
+
+    def test_avas_with_sci_and_state_average(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, mock_avas = self._mods()
+        self._wire(mock_pyscf, mock_mcscf, mock_avas)
+        mock_sci = __import__("unittest.mock", fromlist=["MagicMock"]).MagicMock()
+        mods["pyscf.fci"] = mock_sci
+        mods["pyscf.fci.selected_ci"] = mock_sci.selected_ci
+        mods["pyscf.fci.addons"] = mock_sci.addons
+        coords = np.array([[0., 0., 0.], [0., 0., 2.1]])
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["N", "N"], basis="cc-pvdz",
+                                   method="casci", avas="N 2p",
+                                   fci_solver="sci", nstates=2, state=1,
+                                   state_average=True)
+            calc.energy(coords)
+            mock_avas.avas.assert_called_once()                 # AVAS 生效
+            mock_sci.selected_ci.SCI.assert_called_once()       # SCI 生效
+            self.assertEqual(mock_sci.selected_ci.SCI.return_value.nroots, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
 
