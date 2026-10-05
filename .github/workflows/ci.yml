@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    name: 单元测试 (py${{ matrix.python-version }}, 无外部依赖)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖 (仅 numpy)
+        run: pip install numpy
+      - name: 运行测试
+        run: python -m unittest discover -s tests -v 2>&1 | tail -25
+      - name: 语法编译
+        run: python -m compileall -q aqpes
+
+  cli-smoke:
+    name: CLI 端到端冒烟 (demo 后端)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - name: sample → fit → opt → scan → freq
+        run: |
+          printf '2\nH2 (Bohr)\nH 0 0 0\nH 0 0 1.4\n' > /tmp/h2.xyz
+          python -m aqpes.cli sample --backend demo --input /tmp/h2.xyz \
+              -o /tmp/d.npz --n-per-dim 3 --max-points 60
+          python -m aqpes.cli fit --data /tmp/d.npz -o /tmp/m.pkl --epochs 30 --no-gif
+          python -m aqpes.cli opt --backend demo --input /tmp/h2.xyz
+          python -m aqpes.cli scan --backend demo --input /tmp/h2.xyz \
+              --mode bond --range 1.5 3.5 --n 5 -o /tmp/s.npz
+          python -m aqpes.cli freq --backend demo --input /tmp/h2.xyz --opt-first
+          python -m aqpes.cli backends
+
+  pyscf-smoke:
+    name: PySCF 端到端冒烟 (CCSD + SOC 积分)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 PySCF
+        run: pip install numpy pyscf
+      - name: H₂/CCSD 能量 + 类氢 SOC 常数
+        run: |
+          python - << 'PY'
+          import numpy as np
+          from aqpes.pes.calculators import PySCFCalculator
+          calc = PySCFCalculator(["H", "H"], basis="cc-pvdz", method="ccsd")
+          e = calc.energy(np.array([[0., 0., 0.], [0., 0., 1.4]]))
+          print("H2/cc-pVDZ CCSD E =", e)
+          assert -1.2 < e < -1.0, e
+          # 类氢 ζ 精确值 α²Z⁴/48 (裸核 2p, 偶温非收缩 p 基组)
+          from pyscf import gto
+          from aqpes.pes import soc as S
+          z = 2
+          lines = ["He    S", "    3.42525091  0.15432897",
+                   "    0.62391373  0.53532814", "    0.16885540  0.44463454",
+                   "He    P"]
+          n_p = 12
+          for i, k in enumerate(range(-6, -6 + n_p)):
+              c = ["0.0"] * n_p; c[i] = "1.0"
+              lines.append("    " + f"{0.06 * 2.0 ** k * z * z:.10f}" + "  " + "  ".join(c))
+          mol = gto.M(atom="He 0 0 0", basis="\n".join(lines), charge=1, spin=1, verbose=0)
+          from scipy.linalg import eigh as geigh
+          S_ov = mol.intor("int1e_ovlp"); H1 = mol.intor("int1e_kin") + mol.intor("int1e_nuc")
+          ao_l = np.zeros(mol.nao, dtype=int); idx = 0
+          for ib in range(mol.nbas):
+              l = mol.bas_angular(ib)
+              for _ in range(mol.bas_nctr(ib)):
+                  ao_l[idx:idx + 2 * l + 1] = l; idx += 2 * l + 1
+          pid = np.nonzero(ao_l == 1)[0]
+          w, v = geigh(H1[np.ix_(pid, pid)], S_ov[np.ix_(pid, pid)])
+          C = np.zeros((mol.nao, 3))
+          C[pid[:, None], np.arange(3)[None, :]] = v[:, np.argsort(w)[:3]]
+          zeta = S.soc_zeta(S.soc_integrals_mo(mol, C), [0, 1, 2])
+          exact = S.ALPHA ** 2 * z ** 4 / 48.0 * S.AU2CM
+          print(f"zeta = {zeta:.5f} vs 精确 {exact:.5f} cm^-1 (比 {zeta/exact:.5f})")
+          assert abs(zeta / exact - 1.0) < 0.02, zeta / exact
+          print("OK")
+          PY

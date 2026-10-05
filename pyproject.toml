@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autoquantum-pes"
+version = "0.31.0"
+description = "势能面 (PES) 从头算计算与机器学习拟合工具包 (PySCF/xTB/ASE 后端 + 工作流 + NN 拟合)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+pyscf = ["pyscf>=2.4"]
+ase = ["ase>=3.22"]
+gpu = ["cupy"]
+dev = ["pytest"]
+
+[project.scripts]
+aqpes = "aqpes.cli:main"
+
+[tool.setuptools]
+packages = ["aqpes", "aqpes.core", "aqpes.pes", "aqpes.nn"]

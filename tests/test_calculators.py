@@ -1,0 +1,554 @@
+import shutil
+import unittest
+import numpy as np
+
+from aqpes.pes.calculators import (
+    Calculator, AnalyticCalculator, demo_calculator,
+    available_calculators, make_calculator, CommandBackendError,
+)
+
+
+class TestAnalyticBackend(unittest.TestCase):
+    def test_analytic_gradient_vs_finite_difference(self):
+        # 解析梯度与中心差分一致
+        eps = 0.01, 0.0, 0.0
+        coords = np.array([[0.0, 0.0, 0.0], [3.8, 0.0, 0.0]])
+        calc = demo_calculator()
+        g = calc.gradient(coords)
+        for i in range(2):
+            for j in range(3):
+                cp, cm = coords.copy(), coords.copy()
+                cp[i, j] += 1e-6
+                cm[i, j] -= 1e-6
+                num = (calc.energy(cp) - calc.energy(cm)) / 2e-6
+                self.assertAlmostEqual(g[i, j], num, places=5)
+
+    def test_fd_fallback_matches_analytic(self):
+        # 未提供解析梯度时中心差分回退应逼近解析梯度
+        calc = demo_calculator()
+        fd = AnalyticCalculator(calc.energy_fn, gradient_fn=None, grad_h=1e-5)
+        coords = np.array([[0.0, 0.0, 0.0], [3.5, 0.0, 0.0]])
+        np.testing.assert_allclose(fd.gradient(coords), calc.gradient(coords),
+                                   rtol=1e-5, atol=1e-7)
+
+    def test_energy_and_gradient(self):
+        calc = demo_calculator()
+        r_min = 2 ** (1 / 6) * 3.4      # LJ 极小点 → E = -ε
+        coords = np.array([[0.0, 0.0, 0.0], [r_min, 0.0, 0.0]])
+        e, g = calc.energy_and_gradient(coords)
+        self.assertAlmostEqual(e, -0.01, places=6)
+        self.assertEqual(g.shape, coords.shape)
+        # 极小点处力为零
+        np.testing.assert_allclose(g, 0.0, atol=1e-6)
+        # 力的反作用: ∇_A E = -∇_B E
+        far = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+        g2 = calc.gradient(far)
+        np.testing.assert_allclose(g2[0], -g2[1], rtol=1e-12)
+        self.assertEqual(calc.provenance["backend"], "demo-lj")
+
+
+class TestBackendRegistry(unittest.TestCase):
+    def test_available_calculators_reports_status(self):
+        status = available_calculators()
+        for key in ("analytic", "demo", "xtb", "pyscf", "ase"):
+            self.assertIn(key, status)
+            self.assertIn(status[key]["available"], ("yes", "no"))
+        self.assertEqual(status["xtb"]["available"],
+                         "yes" if shutil.which("xtb") else "no")
+
+    def test_make_calculator_demo_and_unknown(self):
+        calc = make_calculator("demo")
+        self.assertIsInstance(calc, Calculator)
+        with self.assertRaises(ValueError):
+            make_calculator("no-such-backend")
+
+    def test_xtb_missing_gives_informative_error(self):
+        if shutil.which("xtb"):
+            self.skipTest("xtb 已安装, 错误路径不可测")
+        with self.assertRaises(CommandBackendError) as ctx:
+            make_calculator("xtb", symbols=["H", "H"])
+        self.assertIn("xtb", str(ctx.exception))
+
+
+class TestPySCFCalculatorMock(unittest.TestCase):
+    """测试 PySCFCalculator 的高自旋约束、spin_lock、MOM 及复共振势能接口 (Mock 隔离)。"""
+
+    def _get_mock_modules(self):
+        import sys
+        from unittest.mock import MagicMock
+        mock_pyscf = MagicMock()
+        mock_pyscf.__version__ = "2.4.0"
+        mock_gto = MagicMock()
+        mock_scf = MagicMock()
+        mock_dft = MagicMock()
+        mock_addons = MagicMock()
+        mock_lib = MagicMock()
+        mock_lib.asarray.side_effect = lambda x: np.array(x)
+
+        mock_pyscf.gto = mock_gto
+        mock_pyscf.scf = mock_scf
+        mock_scf.addons = mock_addons
+        mock_pyscf.dft = mock_dft
+        mock_pyscf.lib = mock_lib
+
+        mods = {
+            "pyscf": mock_pyscf,
+            "pyscf.gto": mock_gto,
+            "pyscf.scf": mock_scf,
+            "pyscf.scf.addons": mock_addons,
+            "pyscf.dft": mock_dft,
+            "pyscf.lib": mock_lib,
+        }
+        return mods, mock_pyscf
+
+    def test_pyscf_missing_gives_informative_error(self):
+        import sys
+        from unittest.mock import patch
+        with patch.dict(sys.modules, {"pyscf": None}):
+            with self.assertRaises(CommandBackendError) as ctx:
+                make_calculator("pyscf", symbols=["He", "Li"])
+            self.assertIn("未安装 pyscf", str(ctx.exception))
+
+    def test_rhf_energy_and_gradient(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = self._get_mock_modules()
+
+        mock_mol = MagicMock()
+        mock_pyscf.gto.Mole.return_value = mock_mol
+
+        mock_mf = MagicMock()
+        mock_mf.converged = True
+        mock_mf.kernel.return_value = -7.235
+        mock_grad = MagicMock()
+        mock_grad.kernel.return_value = np.array([[0.01, 0.0, 0.0], [-0.01, 0.0, 0.0]])
+        mock_mf.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.scf.RHF.return_value = mock_mf
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["He", "Li"], basis="def2-svp", method="rhf")
+            coords = np.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]])
+            e, g = calc.energy_and_gradient(coords)
+
+            self.assertAlmostEqual(e, -7.235)
+            self.assertEqual(g.shape, (2, 3))
+            self.assertAlmostEqual(g[0, 0], 0.01)
+            self.assertEqual(calc.provenance["method"], "rhf")
+            self.assertEqual(calc.provenance["basis"], "def2-svp")
+
+    def test_high_spin_rohf_and_uhf(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = self._get_mock_modules()
+
+        mock_mol = MagicMock()
+        mock_pyscf.gto.Mole.return_value = mock_mol
+
+        mock_mf = MagicMock()
+        mock_mf.converged = True
+        mock_mf.kernel.return_value = -7.150
+        mock_grad = MagicMock()
+        mock_grad.kernel.return_value = np.zeros((2, 3))
+        mock_mf.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.scf.ROHF.return_value = mock_mf
+
+        with patch.dict(sys.modules, mods):
+            # 四重态 (He* + Li, S=3/2, 2S=3)
+            calc = make_calculator("pyscf", symbols=["He", "Li"], spin=3, method="rohf")
+            coords = np.array([[0.0, 0.0, 0.0], [4.5, 0.0, 0.0]])
+            e = calc.energy(coords)
+            self.assertAlmostEqual(e, -7.150)
+            mock_pyscf.scf.ROHF.assert_called_once()
+            self.assertEqual(calc.provenance["spin"], "3")
+
+    def test_spin_lock_audit_pass_and_fail(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = self._get_mock_modules()
+
+        mock_mol = MagicMock()
+        mock_pyscf.gto.Mole.return_value = mock_mol
+
+        mock_mf = MagicMock()
+        mock_mf.converged = True
+        mock_mf.kernel.return_value = -7.120
+        mock_grad = MagicMock()
+        mock_grad.kernel.return_value = np.zeros((2, 3))
+        mock_mf.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.scf.UHF.return_value = mock_mf
+
+        coords = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+
+        with patch.dict(sys.modules, mods):
+            # 期望 S=1.5, S(S+1)=3.75
+            # 情况 1: 自旋污染在容差内 (3.77 vs 3.75, diff=0.02 <= 0.1) -> 成功
+            mock_mf.spin_square.return_value = (3.77, 1.506)
+            calc_pass = make_calculator("pyscf", symbols=["He", "Li"], spin=3,
+                                        method="uhf", spin_lock=True, spin_tol=0.1)
+            e = calc_pass.energy(coords)
+            self.assertAlmostEqual(e, -7.120)
+
+            # 情况 2: 自旋污染超标 / 态翻转 (2.50 vs 3.75, diff=1.25 > 0.1) -> 触发拦截
+            mock_mf.spin_square.return_value = (2.50, 1.1)
+            calc_fail = make_calculator("pyscf", symbols=["He", "Li"], spin=3,
+                                        method="uhf", spin_lock=True, spin_tol=0.1)
+            with self.assertRaises(CommandBackendError) as ctx:
+                calc_fail.energy(coords)
+            self.assertIn("自旋锁定失败", str(ctx.exception))
+            self.assertIn("自旋污染偏差", str(ctx.exception))
+
+    def test_dft_and_xc_dispatch(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = self._get_mock_modules()
+
+        mock_mol = MagicMock()
+        mock_pyscf.gto.Mole.return_value = mock_mol
+
+        mock_mf = MagicMock()
+        mock_mf.converged = True
+        mock_mf.kernel.return_value = -7.300
+        mock_grad = MagicMock()
+        mock_grad.kernel.return_value = np.zeros((2, 3))
+        mock_mf.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.dft.UKS.return_value = mock_mf
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["He", "Li"], spin=1,
+                                   method="uks", xc="pbe")
+            coords = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+            e = calc.energy(coords)
+            self.assertAlmostEqual(e, -7.300)
+            mock_pyscf.dft.UKS.assert_called_once()
+            self.assertEqual(mock_mf.xc, "pbe")
+            self.assertEqual(calc.provenance["xc"], "pbe")
+
+    def test_mom_tracks_reference_orbitals(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = self._get_mock_modules()
+
+        mock_mol = MagicMock()
+        mock_pyscf.gto.Mole.return_value = mock_mol
+
+        # 模拟两步 ROHF 计算 (He*+Li 四重态: 5 电子 = 4α + 1β, 2S=3)
+        fake_mo_1 = np.eye(5)
+        fake_occ_1 = np.array([2.0, 1.0, 1.0, 1.0, 0.0])  # ROHF 一维占据
+
+        mock_mf = MagicMock()
+        mock_mf.converged = True
+        mock_mf.kernel.return_value = -7.100
+        mock_mf.mo_coeff = fake_mo_1
+        mock_mf.mo_occ = fake_occ_1
+        mock_grad = MagicMock()
+        mock_grad.kernel.return_value = np.zeros((2, 3))
+        mock_mf.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.scf.ROHF.return_value = mock_mf
+        mock_pyscf.scf.addons.mom_occ.return_value = mock_mf
+
+        coords_1 = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+        coords_2 = np.array([[0.0, 0.0, 0.0], [4.2, 0.0, 0.0]])
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["He", "Li"], spin=3,
+                                   method="rohf", use_mom=True)
+            # 第 1 步: 无先验参考, mom_occ 不应调用
+            calc.energy(coords_1)
+            mock_pyscf.scf.addons.mom_occ.assert_not_called()
+
+            # 第 2 步: 存在第 1 步轨道, mom_occ 必须被注入, 且 setocc 为
+            # (2, nmo) 的 alpha/beta 分离数组 (PySCF ROHF MOM 约定)
+            calc.energy(coords_2)
+            mock_pyscf.scf.addons.mom_occ.assert_called_once()
+            call_args = mock_pyscf.scf.addons.mom_occ.call_args
+            occorb_arg, setocc_arg = call_args[0][1], call_args[0][2]
+            np.testing.assert_allclose(occorb_arg, fake_mo_1)
+            self.assertEqual(setocc_arg.shape, (2, 5))
+            # occ=[2,1,1,1,0] → alpha=[1,1,1,1,0], beta=[1,0,0,0,0]
+            np.testing.assert_allclose(setocc_arg, [[1.0, 1.0, 1.0, 1.0, 0.0],
+                                                    [1.0, 0.0, 0.0, 0.0, 0.0]])
+            # 4α - 1β = 3 = 2S ✓, 总电子数 5 ✓
+            self.assertAlmostEqual(setocc_arg[0].sum() - setocc_arg[1].sum(), 3.0)
+            self.assertAlmostEqual(setocc_arg.sum(), 5.0)
+
+            # 重置 MOM
+            calc.reset_mom()
+            self.assertIsNone(calc._ref_mo_coeff)
+
+    def test_mom_setocc_conversion_uhf(self):
+        """UHF/UKS 的 (2,nmo) 0/1 占据数组应原样透传。"""
+        from aqpes.pes.calculators import PySCFCalculator
+        occ_uhf = np.array([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+        out = PySCFCalculator._mom_setocc(occ_uhf)
+        np.testing.assert_allclose(out, occ_uhf)
+        # ROHF 一维 {2,1,0} → (2,nmo)
+        out_rohf = PySCFCalculator._mom_setocc(np.array([2.0, 1.0, 0.0]))
+        np.testing.assert_allclose(out_rohf, [[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+
+    def test_resonance_width_and_complex_energy(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = self._get_mock_modules()
+
+        mock_mol = MagicMock()
+        mock_pyscf.gto.Mole.return_value = mock_mol
+        mock_mf = MagicMock()
+        mock_mf.converged = True
+        mock_mf.kernel.return_value = -7.000
+        mock_grad = MagicMock()
+        mock_grad.kernel.return_value = np.zeros((2, 3))
+        mock_mf.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.scf.RHF.return_value = mock_mf
+
+        coords = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
+
+        with patch.dict(sys.modules, mods):
+            # 1. 默认无 CAP: 衰减宽度为 0, 复能量虚部为 0
+            calc_real = make_calculator("pyscf", symbols=["He", "Li"])
+            self.assertAlmostEqual(calc_real.resonance_width(coords), 0.0)
+            self.assertEqual(calc_real.complex_energy(coords), complex(-7.000, 0.0))
+
+            # 2. 指数型自电离宽度: Gamma(R) = A * exp(-beta * R)
+            cap_exp = {"type": "exponential", "A": 0.05, "beta": 0.5, "r_index": (0, 1)}
+            calc_exp = make_calculator("pyscf", symbols=["He", "Li"], cap_params=cap_exp)
+            expected_gamma = 0.05 * np.exp(-0.5 * 4.0)
+            self.assertAlmostEqual(calc_exp.resonance_width(coords), expected_gamma, places=7)
+            z = calc_exp.complex_energy(coords)
+            self.assertAlmostEqual(z.real, -7.000)
+            self.assertAlmostEqual(z.imag, -0.5 * expected_gamma)
+
+            # 3. 盒式 CAP 宽度: r_cap=3.0, R=4.0 > 3.0 -> Gamma = 2 * eta * (4 - 3)^2
+            cap_box = {"type": "box", "eta": 0.01, "r_cap": 3.0, "r_index": (0, 1)}
+            calc_box = make_calculator("pyscf", symbols=["He", "Li"], cap_params=cap_box)
+            self.assertAlmostEqual(calc_box.resonance_width(coords), 2.0 * 0.01 * (1.0 ** 2))
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class TestCorrelatedMethodDispatch(unittest.TestCase):
+    """相关方法 (MP2/CCSD/CCSD(T)) 的分发与梯度级别 (Mock 隔离)。"""
+
+    def test_unknown_method_rejected(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        import numpy as np
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        with patch.dict(sys.modules, mods):
+            with self.assertRaises(ValueError):
+                make_calculator("pyscf", symbols=["H", "H"], method="mp3")
+
+    def test_correlated_dispatch_and_grad_level(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        mock_mf = MagicMock(); mock_mf.converged = True
+        mock_mf.e_tot = -1.128
+        mock_mf.kernel.return_value = -1.128
+        mock_pyscf.scf.RHF.return_value = mock_mf
+        # CCSD 求解器
+        mock_cc = MagicMock()
+        mock_cc.kernel.return_value = (-0.035, None, None)
+        mock_cc.ccsd_t.return_value = -0.0001
+        mock_grad = MagicMock(); mock_grad.kernel.return_value = np.zeros((2, 3))
+        mock_cc.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.cc.CCSD.return_value = mock_cc
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["H", "H"], method="ccsd(t)")
+            coords = np.array([[0., 0., 0.], [0., 0., 1.4]])
+            e, g = calc.energy_and_gradient(coords)
+            # 能量 = SCF + E_corr + (T)
+            self.assertAlmostEqual(e, -1.128 - 0.035 - 0.0001, places=6)
+            self.assertEqual(g.shape, (2, 3))
+            # provenance 记录梯度级别
+            self.assertEqual(calc.provenance["grad_t_mode"], "fd")
+            self.assertEqual(calc.provenance["method"], "ccsd(t)")
+
+    def test_energy_does_not_compute_gradient(self):
+        """energy() 不应触发梯度 (CCSD(T) 的 (T) 梯度是 6N 次 CCSD(T))。"""
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        mock_mf = MagicMock(); mock_mf.converged = True
+        mock_mf.e_tot = -1.128; mock_mf.kernel.return_value = -1.128
+        mock_pyscf.scf.RHF.return_value = mock_mf
+        mock_cc = MagicMock()
+        mock_cc.kernel.return_value = (-0.035, None, None)
+        mock_cc.ccsd_t.return_value = -0.0001
+        mock_pyscf.cc.CCSD.return_value = mock_cc
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["H", "H"], method="ccsd(t)")
+            coords = np.array([[0., 0., 0.], [0., 0., 1.4]])
+            e = calc.energy(coords)
+            mock_cc.nuc_grad_method.assert_not_called()
+
+
+class TestPySCFSolventModelsMock(unittest.TestCase):
+    """溶剂模型分发 (ddcosmo/pcm/ddpcm/smd) 的 Mock 隔离测试 (v0.30.0)。"""
+
+    def _get_mock_modules(self):
+        from unittest.mock import MagicMock
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_solvent = MagicMock()
+        mock_pyscf.solvent = mock_solvent
+        mods["pyscf.solvent"] = mock_solvent
+        for name in ("ddcosmo", "pcm", "ddpcm"):
+            sub = MagicMock()
+            setattr(mock_solvent, name, sub)
+            mods[f"pyscf.solvent.{name}"] = sub
+        # 真实 smd 模块只有 SCF 入口 (smd_for_scf) → 用 spec 复现该边界
+        mock_smd = MagicMock(
+            spec=["smd_for_scf", "SMD", "solvent_db", "LEBEDEV_ORDER"])
+        mock_solvent.smd = mock_smd
+        mods["pyscf.solvent.smd"] = mock_smd
+        return mods, mock_pyscf, mock_solvent
+
+    def _mock_mf(self, mock_pyscf, mock_solvent, e=-76.02):
+        from unittest.mock import MagicMock
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        mock_mf = MagicMock()
+        mock_mf.converged = True
+        mock_mf.kernel.return_value = e
+        mock_grad = MagicMock()
+        mock_grad.kernel.return_value = np.array([[0.01, 0.0, 0.0], [-0.01, 0.0, 0.0]])
+        mock_mf.nuc_grad_method.return_value = mock_grad
+        mock_pyscf.scf.RHF.return_value = mock_mf
+        # 溶剂入口返回同一个 mf (带 with_solvent), 模拟 PySCF 包装行为
+        for fn in (mock_solvent.ddcosmo.ddcosmo_for_scf,
+                   mock_solvent.pcm.pcm_for_scf,
+                   mock_solvent.ddpcm.ddpcm_for_scf,
+                   mock_solvent.smd.smd_for_scf):
+            fn.return_value = mock_mf
+        return mock_mf
+
+    def test_pcm_dispatch_sets_variant_and_eps(self):
+        import sys
+        from unittest.mock import patch
+        from aqpes.pes.calculators import _SOLVENT_EPS
+        mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+        mock_mf = self._mock_mf(mock_pyscf, mock_solvent)
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                   basis="6-31g*", solvent="water",
+                                   solvent_model="pcm", pcm_variant="C-PCM")
+            coords = np.array([[0., 0., 0.], [0., 0., 1.4], [0., 1.0, -0.4]])
+            calc.energy(coords)
+            mock_solvent.pcm.pcm_for_scf.assert_called_once()
+            # PCM 变体与介电常数都必须落到溶剂对象上
+            ws = mock_mf.with_solvent
+            self.assertEqual(ws.method, "C-PCM")
+            self.assertAlmostEqual(ws.eps, _SOLVENT_EPS["water"])
+            self.assertIn("pcm/C-PCM", calc.provenance["solvent"])
+            self.assertIn(str(_SOLVENT_EPS["water"]), calc.provenance["solvent"])
+
+    def test_ddpcm_uses_fd_gradient(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+        mock_mf = self._mock_mf(mock_pyscf, mock_solvent)
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                   solvent_eps=78.4, solvent_model="ddpcm")
+            self.assertTrue(calc._solvent_fd_grad)
+            coords = np.array([[0., 0., 0.], [0., 0., 1.4], [0., 1.0, -0.4]])
+            calc.energy_and_gradient(coords)
+            # FD 路径 = 每扰动点一次 SCF (3 原子 → 19 次), 而非 1 次解析梯度
+            self.assertGreaterEqual(mock_solvent.ddpcm.ddpcm_for_scf.call_count, 7)
+            # ddPCM 无解析溶剂梯度模块 → 不得调用 nuc_grad_method
+            mock_mf.nuc_grad_method.assert_not_called()
+
+    def test_analytic_solvent_gradients_kept_for_ddcosmo_pcm(self):
+        import sys
+        from unittest.mock import patch
+        for model in ("ddcosmo", "pcm"):
+            mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+            mock_mf = self._mock_mf(mock_pyscf, mock_solvent)
+            with patch.dict(sys.modules, mods):
+                calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                       solvent_eps=78.4, solvent_model=model)
+                self.assertFalse(calc._solvent_fd_grad)
+                coords = np.array([[0., 0., 0.], [0., 0., 1.4], [0., 1.0, -0.4]])
+                calc.gradient(coords)
+                mock_mf.nuc_grad_method.assert_called_once()
+
+    def test_smd_requires_named_solvent(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+        self._mock_mf(mock_pyscf, mock_solvent)
+        with patch.dict(sys.modules, mods):
+            with self.assertRaises(ValueError) as ctx:
+                make_calculator("pyscf", symbols=["O", "H", "H"],
+                                solvent_model="smd")
+            self.assertIn("命名溶剂", str(ctx.exception))
+            with self.assertRaises(ValueError) as ctx2:
+                make_calculator("pyscf", symbols=["O", "H", "H"],
+                                solvent="water", solvent_eps=78.4,
+                                solvent_model="smd")
+            self.assertIn("solvent_eps", str(ctx2.exception))
+
+    def test_smd_post_scf_entry_rejected(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+        self._mock_mf(mock_pyscf, mock_solvent)
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                   solvent="water", solvent_model="smd")
+            # 非 SCF 入口必须明确报错 (而非静默回退气相)
+            with self.assertRaises(CommandBackendError) as ctx:
+                calc._attach_solvent(MagicMock(), "post")
+            self.assertIn("SCF", str(ctx.exception))
+            # SCF 入口正常, 且溶剂对象由 SMD 构造 (含非静电项参数集)
+            calc._attach_solvent(MagicMock(), "scf")
+            self.assertEqual(
+                mock_solvent.smd.SMD.call_args.kwargs["solvent"], "water")
+
+    def test_smd_unknown_solvent_gives_informative_error(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+        self._mock_mf(mock_pyscf, mock_solvent)
+        mock_solvent.smd.SMD.side_effect = RuntimeError("nosuch is not available in SMD")
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                   solvent="nosuch", solvent_model="smd")
+            with self.assertRaises(CommandBackendError) as ctx:
+                calc._attach_solvent(MagicMock(), "scf")
+            self.assertIn("SMD", str(ctx.exception))
+
+    def test_invalid_model_and_variant_rejected(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+        self._mock_mf(mock_pyscf, mock_solvent)
+        with patch.dict(sys.modules, mods):
+            with self.assertRaises(ValueError):
+                make_calculator("pyscf", symbols=["H", "H"],
+                                solvent="water", solvent_model="cosmo2")
+            with self.assertRaises(ValueError):
+                make_calculator("pyscf", symbols=["H", "H"],
+                                solvent="water", solvent_model="pcm",
+                                pcm_variant="IEFPCM")
+
+    def test_no_solvent_keeps_gas_phase_path(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_solvent = self._get_mock_modules()
+        self._mock_mf(mock_pyscf, mock_solvent)
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["H", "H"], method="rhf")
+            coords = np.array([[0., 0., 0.], [0., 0., 1.4]])
+            calc.energy(coords)
+            mock_solvent.ddcosmo.ddcosmo_for_scf.assert_not_called()
+            self.assertEqual(calc.provenance["solvent"], "none")
+
+
+if __name__ == "__main__":
+    unittest.main()
