@@ -21,7 +21,7 @@ cp "$SRC"/autoquantum/nn/*.py  "$DST/$PKG/nn/"
 for f in base.py periodic.py validation.py; do cp "$SRC/autoquantum/core/$f" "$DST/$PKG/core/"; done
 cp "$SRC/autoquantum/cli.py" "$DST/$PKG/cli.py"
 for name in test_calculators test_pes test_leps test_abinitio test_optimize_scan \
-            test_nn test_symmetry test_soc test_data_pipeline; do
+            test_nn test_symmetry test_soc test_data_pipeline test_composite; do
   [ -f "$SRC/tests/$name.py" ] && cp "$SRC/tests/$name.py" "$DST/tests/$name.py"
 done
 
