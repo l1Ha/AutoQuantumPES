@@ -87,7 +87,7 @@ class TestCLIDataPipeline(unittest.TestCase):
             pkl = os.path.join(tmp, "m.pkl")
 
             import sys
-            sys.argv = ["autoquantum", "sample", "--backend", "demo",
+            sys.argv = ["aqpes", "sample", "--backend", "demo",
                         "--input", xyz, "-o", npz, "--n-per-dim", "5",
                         "--range", "-0.3", "0.3", "--active-atoms", "1",
                         "--min-distance", "1.5", "--max-points", "50"]
@@ -97,7 +97,7 @@ class TestCLIDataPipeline(unittest.TestCase):
             data = AbInitioData.load_npz(npz)
             self.assertEqual(data.n_points, 50)
 
-            sys.argv = ["autoquantum", "fit", "--data", npz, "-o", pkl,
+            sys.argv = ["aqpes", "fit", "--data", npz, "-o", pkl,
                         "--epochs", "300", "--layers", "32", "32",
                         "--force-weight", "1.0"]
             self.assertEqual(main(), 0)
@@ -140,7 +140,7 @@ class TestCLISymmetryFit(unittest.TestCase):
             pkl = os.path.join(tmp, "c.pkl")
             np.savez(npz, points=c.reshape(n, 9), energies=E,
                      symbols=np.array(["O", "H", "H"]))
-            sys.argv = ["autoquantum", "fit", "--data", npz, "-o", pkl,
+            sys.argv = ["aqpes", "fit", "--data", npz, "-o", pkl,
                        "--symmetry", "--committee", "2", "--epochs", "1200"]
             self.assertEqual(main(), 0)
             self.assertTrue(os.path.exists(pkl))

@@ -154,6 +154,37 @@ t = t.replace("从 AutoQuantumDynamics 单体仓库拆分的**独立子集**:\n"
               "独立的势能面 (PES) 计算与拟合工具包:\n")
 ap.write_text(t, encoding="utf-8")
 
+# ---- 6) 上游包名痕迹清理 (docstring/环境信息键) 与文件权限归一 ----
+vp2 = root / pkg / "core" / "validation.py"
+t = vp2.read_text(encoding="utf-8")
+t = t.replace('info["autoquantum"] = aq_version', 'info["aqpes"] = aq_version')
+vp2.write_text(t, encoding="utf-8")
+
+mp2 = root / pkg / "nn" / "model.py"
+t = mp2.read_text(encoding="utf-8")
+t = t.replace("autoquantum 版本), 随 save/load 持久化", "aqpes 版本), 随 save/load 持久化")
+mp2.write_text(t, encoding="utf-8")
+
+cp2 = root / pkg / "pes" / "calculators.py"
+t = cp2.read_text(encoding="utf-8")
+t = t.replace("见 ``autoquantum.pes.soc``", "见 ``aqpes.pes.soc``")
+t = t.replace("让 ``autoquantum sample/fit`` 闭环", "让 ``aqpes sample/fit`` 闭环")
+cp2.write_text(t, encoding="utf-8")
+
+clp = root / pkg / "cli.py"
+t = clp.read_text(encoding="utf-8")
+t = t.replace('prog="autoquantum"', 'prog="aqpes"')
+clp.write_text(t, encoding="utf-8")
+
+for tp in root.glob("tests/*.py"):
+    t = tp.read_text(encoding="utf-8")
+    t = t.replace('sys.argv = ["autoquantum",', 'sys.argv = ["aqpes",')
+    tp.write_text(t, encoding="utf-8")
+
+# 复制自挂载盘的文件可能带 755/600 → 统一 644
+for p_ in list(root.glob(f"{pkg}/**/*.py")) + list(root.glob("tests/*.py")):
+    p_.chmod(0o644)
+
 print("✓ 同步与裁剪完成")
 PYEOF
 

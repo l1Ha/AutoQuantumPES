@@ -230,7 +230,7 @@ class PySCFCalculator(Calculator):
     - **自旋-轨道耦合 (SOC, v0.31.0)**: 单电子 Breit–Pauli 三层接口 —
       :meth:`soc_terms` (轨道层 ζ/精细结构分裂) 与
       :meth:`soc_state_interaction` (单重态-三重态耦合矩阵, cm⁻¹);
-      见 ``autoquantum.pes.soc`` (含逐元素误差的诚实边界)
+      见 ``aqpes.pes.soc`` (含逐元素误差的诚实边界)
     """
 
     name = "pyscf"
@@ -1024,7 +1024,7 @@ class ASECalculatorAdapter(Calculator):
 def demo_calculator(epsilon: float = 0.01, sigma: float = 3.4) -> Calculator:
     """内置 Lennard-Jones 二聚体演示后端 (解析能量+梯度)。
 
-    用途: 让 ``autoquantum sample/fit`` 闭环在无任何外部量子化学程序
+    用途: 让 ``aqpes sample/fit`` 闭环在无任何外部量子化学程序
     的环境中也可完整运行与验证。**这不是量子化学计算** — 势能面是
     虚构的 LJ 对势, 仅演示数据生成→力训练管线。
     """

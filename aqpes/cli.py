@@ -7,7 +7,7 @@ from aqpes import __version__
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="autoquantum",
+        prog="aqpes",
         description="AutoQuantumPES: 势能面计算与拟合 (PES 子集)",
     )
     parser.add_argument(

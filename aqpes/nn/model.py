@@ -333,7 +333,7 @@ class PESNN:
     """势能面代理模型: 支持一维 (n,) 与二维 (n, d) 物理单位调用。
 
     模型携带 ``training_card`` (训练元数据: 数据指纹/RMSE/超参/
-    autoquantum 版本), 随 save/load 持久化 — 模型文件自解释其训练来源。
+    aqpes 版本), 随 save/load 持久化 — 模型文件自解释其训练来源。
     """
 
     def __init__(self, model: FeedForwardNN,
