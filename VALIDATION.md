@@ -18,6 +18,7 @@
 | `cluster_tddft_validation_1558827.log` | 1558827 (xc003, 73 s) | TD-DFT/TDHF 激发态势能面 | 全部通过：H₂O **7.605 eV vs 实验 7.4 (2.8%)**；振子强度 Σf < TRK 上界 |
 | `cluster_ddcosmo_validation_1558838.log` | 1558838 (xc003, 71 s) | ddCOSMO 隐式溶剂 | 全部通过 (7/7)：ε→1 **0.000000**；Li⁺ Born 比值 1.19；梯度 vs FD 3.6e-07 |
 | `cluster_eom_ccsd_validation_1558875.log` | 1558875 (xc003, 668 s) | EOM-CCSD 激发态 + 根跟踪 | 全部通过：单重态激发能 vs FCI **0.000 eV**；**根跟踪为负结果**（重叠判据未改善连续性，已如实记录） |
+| `cluster_sa_casscf_validation_1559180.log` | 1559180 (xc003, 514 s) | **态平均 CASSCF 激发态 + NEVPT2(root)** | 全部通过 (A–E): SA(2) 自旋纯 = **FCI 单重态** (8.9e-16/3.3e-16); LiH 避交叉扫描无交叉、CI 重叠 **0.999895**、ΔE_min 1.5835 eV @ 5.60 Bohr; NEVPT2 对 FCI 拉近 **25.04→9.32 mHa** (如实报告态平均轨道代价 8–10 mHa); 基态 = 单态 = FCI (0.0e+00) |
 | `cluster_solvent_validation_1558906.log` | 1558906 (xc003, 278 s) | PCM / ddPCM / SMD 溶剂模型 | 全部通过 (8/8)：ε→1 = 0；介电单调；跨模型比 1.49；PCM 梯度 vs FD **4.4e-07**；SMD CH₄ **+2.19 vs 实验 +1.95** |
 
 ## 自旋-轨道耦合 (SOC) 验证状态 — **已完成 (A–G 全绿)**

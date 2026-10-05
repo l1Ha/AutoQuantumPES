@@ -216,7 +216,10 @@ class PySCFCalculator(Calculator):
 
     支持能力:
     - **SCF 层**: RHF, ROHF, UHF, DFT (RKS/ROKS/UKS)
-    - **多参考** (v0.25.0–v0.26.0): CASSCF + **NEVPT2 动态相关** — 键断裂/强关联
+    - **多参考** (v0.25.0–v0.32.0): CASSCF + **NEVPT2 动态相关**;
+      **态平均 CASSCF 激发态** (`state_average=True` + `nstates>1` + `state=k`,
+      自旋纯, 天然抑制态身份漂移) —
+      键断裂/强关联/激发态势能面
     - **激发态** (v0.27.0–v0.29.0): TD-DFT/TDHF 与 **EOM-CCSD**; `state=k` 即
       激发态势能面; `follow=True` 启用**根跟踪** (态交叉时保持物理身份)
     - **隐式溶剂** (v0.28.0–v0.30.0): `solvent_model` = ddCOSMO (默认) /
@@ -260,6 +263,8 @@ class PySCFCalculator(Calculator):
                  active_space: Optional[Tuple[int, int]] = None,
                  pt2: Optional[str] = None,
                  nstates: int = 5, state: Optional[int] = None,
+                 state_weights: Optional[Sequence[float]] = None,
+                 state_average: bool = False,
                  solvent: Optional[str] = None,
                  solvent_eps: Optional[float] = None,
                  solvent_model: str = "ddcosmo",
@@ -306,6 +311,12 @@ class PySCFCalculator(Calculator):
         # 频率等全部工作流可直接作用于**激发态势能面**。
         self.nstates = int(nstates)
         self.state = None if state is None else int(state)
+        # 态平均 CASSCF (v0.32.0): **显式开关** state_average=True + nstates>1。
+        # 不设开关时保持历史行为 (单态 CASSCF) —— 注意 nstates 的默认值是 5
+        # (为 TD-DFT 而设), 若隐式触发会使既有 CASSCF 工作流悄悄变成 5 态平均。
+        self.state_average = bool(state_average)
+        self.state_weights = (None if state_weights is None
+                              else [float(w) for w in state_weights])
         # 激发态根跟踪 (v0.29.0): follow=True 时按与上一几何的激发向量
         # 最大重叠选根, 避免态交叉处 state 序号物理身份漂移
         self.follow = bool(follow)
@@ -371,6 +382,8 @@ class PySCFCalculator(Calculator):
 
         self._ref_mo_coeff = None
         self._ref_mo_occ = None
+        self._prev_casscf_ci = None
+        self.last_state_energies = None
         self._initial_mo_coeff = None
         self._initial_mo_occ = None
 
@@ -419,6 +432,31 @@ class PySCFCalculator(Calculator):
             return f"smd/{self.solvent} (eps 由 SMD 数据库)"
         extra = f"/{self.pcm_variant}" if self.solvent_model == "pcm" else ""
         return f"{self.solvent_model}{extra} (eps={self.solvent_eps})"
+
+    def _pick_casscf_root(self, mc, default_idx: int) -> int:
+        """态平均 CASSCF 的根跟踪: 按与上一几何 **CI 向量最大重叠** 选根。
+
+        态平均轨道本身已使曲线平滑; 该跟踪在近简并处进一步保持物理身份。
+        返回选中的态索引, 并更新参考 CI 向量。
+        """
+        ci = getattr(mc, "ci", None)
+        if ci is None:
+            return default_idx
+        if isinstance(ci, np.ndarray) and ci.ndim == 3:
+            ci_list = [ci[k] for k in range(ci.shape[0])]
+        elif isinstance(ci, (list, tuple)):
+            ci_list = list(ci)
+        else:
+            return default_idx
+        cur = [np.asarray(c).ravel() for c in ci_list]
+        prev = self._prev_casscf_ci
+        idx = default_idx
+        if prev is not None and len(prev) == len(cur) \
+                and prev[0].size == cur[0].size and 0 <= default_idx < len(prev):
+            ov = [abs(float(np.dot(c, prev[default_idx]))) for c in cur]
+            idx = int(np.argmax(ov))
+        self._prev_casscf_ci = [c.copy() for c in cur]
+        return idx
 
     def _attach_solvent(self, obj, kind: str = "scf"):
         """把隐式溶剂接入 SCF / post-SCF / TD / CASSCF 对象。
@@ -663,14 +701,77 @@ class PySCFCalculator(Calculator):
             ncas, nelecas = self.active_space
             mc = mcscf.CASSCF(mf, int(ncas), int(nelecas))
             mc = self._attach_solvent(mc, "casscf")
+            sa = bool(self.state_average) and int(self.nstates) > 1
+            nst = int(self.nstates) if sa else 1
+            # 态平均 CASSCF (v0.32.0): state_average=True 且 nstates>1 →
+            # state_average_(等权或给定权重)。态平均轨道的**共同**轨道基使各态
+            # 能量随几何**平滑**变化 —— 态交叉处"态身份漂移"的标准解法
+            # (优于事后根跟踪启发式)。
+            from pyscf import fci as _fci
+            s2_t = (abs(self.spin) / 2.0) * (abs(self.spin) / 2.0 + 1.0)
+            if sa:
+                w = (list(self.state_weights) if self.state_weights is not None
+                     else [1.0 / nst] * nst)
+                if len(w) != nst:
+                    raise CommandBackendError(
+                        f"state_weights 长度 {len(w)} != nstates {nst}")
+                # ⚠ 必须用**自旋纯**求解器: PySCF 默认 direct_spin1 返回该 M_s
+                # 扇区内能量最低的根 (不分自旋) —— 例如 H₂ 会先给出 ³Σu⁺ 而
+                # 不是第二个单重态 (实测: E1 = −0.5318 vs FCI 单重态 −0.1693)。
+                solver = _fci.direct_spin1.FCI(mf.mol)
+                solver.nroots = nst
+                _fci.addons.fix_spin_(solver, shift=0.5, ss=s2_t)
+                mc.fcisolver = solver
+                mc = mcscf.state_average_(mc, w)
             mc.conv_tol = max(self.conv_tol, 1e-8)
             mc.max_cycle = self.max_cycle
-            e = float(mc.kernel()[0])
+            mc.kernel()
             if not mc.converged:
                 raise CommandBackendError("CASSCF 未收敛")
+            e_states = None
+            if nst > 1:
+                e_states = np.asarray(getattr(mc, "e_states", []),
+                                      dtype=float).ravel()
+                if e_states.size != nst:
+                    raise CommandBackendError(
+                        f"态平均 CASSCF 未返回 {nst} 个 e_states "
+                        f"(得到 {e_states.size})")
+                self.last_state_energies = e_states
+            idx = 0
+            if self.state is not None:
+                if nst <= 1:
+                    if int(self.state) != 0:
+                        raise CommandBackendError(
+                            'method="casscf" 的 state=k>0 需要态平均 '
+                            '(state_average=True 且 nstates>1); 单态 CASSCF 只有基态')
+                    idx = 0
+                else:
+                    if not (0 <= self.state < nst):
+                        raise CommandBackendError(
+                            f"state={self.state} 超出范围 (共 {nst} 个态平均态)")
+                    idx = int(self.state)
+                    if self.follow:
+                        idx = self._pick_casscf_root(mc, idx)
+            e = float(e_states[idx]) if e_states is not None else float(mc.e_tot)
             if self.pt2 == "nevpt2":
                 from pyscf import mrpt
-                e_pt2 = float(mrpt.NEVPT(mc).kernel())
+                if sa:
+                    # ⚠ PySCF 实测限制: NEVPT 不接受 state-average FCI 求解器
+                    # ("State-average FCI solver object cannot be used in NEVPT2
+                    # calculation") → 按官方建议 (examples/mrpt/41) 在**同一套
+                    # 态平均轨道**上做独立多根 CASCI, 再对目标根做 NEVPT2。
+                    from pyscf import mcscf as _mcscf
+                    mc_ci = _mcscf.CASCI(mf, int(ncas), int(nelecas))
+                    mc_ci.verbose = 0
+                    sc = _fci.direct_spin1.FCI(mf.mol)
+                    sc.nroots = nst
+                    _fci.addons.fix_spin_(sc, shift=0.5, ss=s2_t)
+                    mc_ci.fcisolver = sc
+                    mc_ci.kernel(mc.mo_coeff)
+                    e_pt2 = float(mrpt.NEVPT(mc_ci, root=idx).kernel())
+                else:
+                    # 单态: 直接用 CASSCF 对象 (v0.26.0 已验证路径)
+                    e_pt2 = float(mrpt.NEVPT(mc, root=idx).kernel())
                 e = e + e_pt2          # 动态相关修正 (二阶微扰)
             self._last_solver = mc
             if not need_grad:
@@ -763,8 +864,17 @@ class PySCFCalculator(Calculator):
                 np.asarray(self.last_oscillator_strengths))
 
     def _energy_only(self, coords: np.ndarray) -> float:
-        """仅算能量 (供 CASSCF 有限差分梯度使用, 避免递归求梯度)。"""
-        return self._run(coords, need_grad=False)[0]
+        """仅算能量 (供有限差分梯度使用, 避免递归求梯度)。
+
+        ⚠ FD 采样点**不得**更新根跟踪参考态 (否则每个扰动点都会覆盖
+        ``_prev_exc_vec``/``_prev_casscf_ci``, 污染真实的跟踪链)。
+        """
+        saved = self.follow
+        self.follow = False
+        try:
+            return self._run(coords, need_grad=False)[0]
+        finally:
+            self.follow = saved
 
     def _t_increment(self, coords: np.ndarray, guess=None):
         """(T) 能量增量 E_(T) = E_CCSD(T) - E_CCSD (Hartree)。
@@ -963,11 +1073,20 @@ class PySCFCalculator(Calculator):
                              if self.active_space else "n/a"),
             "pt2": str(self.pt2 or "none"),
             "solvent": self._solvent_desc(),
-            "nstates": (str(self.nstates) if self.method == "tddft" else "n/a"),
+            "nstates": (str(self.nstates)
+                        if self.method in ("tddft", "casscf") else "n/a"),
             "state": (str(self.state)
-                      if self.method in ("tddft", "eom-ccsd") else "n/a"),
+                      if self.method in ("tddft", "eom-ccsd", "casscf")
+                      else "n/a"),
             "follow": (str(self.follow)
-                       if self.method in ("tddft", "eom-ccsd") else "n/a"),
+                       if self.method in ("tddft", "eom-ccsd", "casscf")
+                       else "n/a"),
+            "state_average": (str(self.state_average)
+                              if self.method == "casscf" else "n/a"),
+            "state_weights": (str(self.state_weights)
+                              if (self.method == "casscf"
+                                  and self.state_average
+                                  and self.nstates > 1) else "n/a"),
             "grad_t_mode": (self.grad_t_mode
                             if self.method in ("ccsd(t)", "ccsd_t") else "n/a"),
         }

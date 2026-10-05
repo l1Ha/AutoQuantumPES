@@ -59,6 +59,7 @@ AutoQuantumPES/
 | ECP / 赝势 | AuH/cc-pVDZ-PP 梯度 vs FD **4.5e-07** |
 | 标量相对论 (X2C) | vs **精确 Dirac 能**: H 0.4%, He⁺ 1.0% |
 | CASSCF 多参考 | H₂ 解离 R=4 Bohr: \|RHF−FCI\| 105.6 mHa → \|CASSCF−FCI\| **0.9 mHa** |
+| **态平均 CASSCF 激发态** + NEVPT2(root) | SA(2) vs **FCI 单重态 8.9e-16**; LiH 避交叉扫描: 无交叉、CI 向量重叠 **0.999895**、ΔE_min 1.5835 eV @ 5.60 Bohr; NEVPT2 对 FCI 拉近 **25.0→9.3 mHa** (Slurm 1559180, 514 s, exit 0) |
 | NEVPT2 动态相关 | H₂/CAS(8,2) 距 FCI **0.10 mHa**; LiH 改善 2.5–2.7× |
 | TD-DFT/TDHF 激发态势能面 | H₂O 最低激发 **7.605 eV vs 实验 7.4 (2.8%)**; 振子强度 Σf < TRK 上界 |
 | EOM-CCSD 激发态 | vs FCI 单重态激发能 **偏差 0.000 eV**; H₂O 8.675 vs TD-DFT 8.061 eV |

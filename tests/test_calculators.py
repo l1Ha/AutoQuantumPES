@@ -323,6 +323,166 @@ class TestPySCFCalculatorMock(unittest.TestCase):
             self.assertAlmostEqual(calc_box.resonance_width(coords), 2.0 * 0.01 * (1.0 ** 2))
 
 
+class TestSACASSCFMock(unittest.TestCase):
+    """态平均 CASSCF (v0.32.0): 分发 / 态选择 / NEVPT2(root) / 错误路径 (Mock)。"""
+
+    def _mods(self):
+        import sys
+        from unittest.mock import MagicMock
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_mcscf = MagicMock()
+        mock_mrpt = MagicMock()
+        mock_solvent = MagicMock()
+        mock_pyscf.mcscf = mock_mcscf
+        mock_pyscf.mrpt = mock_mrpt
+        mock_pyscf.solvent = mock_solvent
+        mods.update({"pyscf.mcscf": mock_mcscf, "pyscf.mrpt": mock_mrpt,
+                     "pyscf.solvent": mock_solvent})
+        return mods, mock_pyscf, mock_mcscf, mock_mrpt
+
+    def _mock_mc(self, mock_pyscf, mock_mcscf, e_states=(-1.10, -1.05)):
+        from unittest.mock import MagicMock
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        mf = MagicMock()
+        mf.converged = True
+        mf.kernel.return_value = -1.12
+        mf.mo_coeff = np.eye(4)
+        mf.mo_occ = np.array([2.0, 0.0, 0.0, 0.0])
+        mock_pyscf.scf.RHF.return_value = mf
+        mc = MagicMock()
+        mc.converged = True
+        mc.kernel.return_value = (float(np.mean(e_states)), None)
+        mc.e_states = np.asarray(e_states, dtype=float)
+        mc.e_tot = float(np.mean(e_states))
+        mc.ci = None
+        mock_mcscf.CASSCF.return_value = mc
+        return mc
+
+    def test_state_average_dispatch_and_state_selection(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, _ = self._mods()
+        mc = self._mock_mc(mock_pyscf, mock_mcscf)
+        mock_mcscf.state_average_.return_value = mc
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                   active_space=(2, 2), nstates=2, state=1,
+                                   state_average=True)
+            e = calc.energy(np.array([[0., 0., 0.], [0., 0., 1.4]]))
+            # 态平均必须被调用, 且等权 [0.5, 0.5]
+            mock_mcscf.state_average_.assert_called_once()
+            w = mock_mcscf.state_average_.call_args.args[1]
+            np.testing.assert_allclose(w, [0.5, 0.5])
+            # state=1 → 取第 2 个态的能量 (而非态平均能量)
+            self.assertAlmostEqual(e, -1.05)
+            np.testing.assert_allclose(calc.last_state_energies, [-1.10, -1.05])
+            self.assertEqual(calc.provenance["nstates"], "2")
+            self.assertEqual(calc.provenance["state"], "1")
+
+    def test_nevpt2_on_excited_root(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, mock_mrpt = self._mods()
+        mc = self._mock_mc(mock_pyscf, mock_mcscf)
+        mock_mcscf.state_average_.return_value = mc
+        nev = mock_mrpt.NEVPT.return_value
+        nev.kernel.return_value = -0.02
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                   active_space=(2, 2), nstates=2, state=1,
+                                   state_average=True, pt2="nevpt2")
+            e = calc.energy(np.array([[0., 0., 0.], [0., 0., 1.4]]))
+            # NEVPT2 必须落在所选的态 (root=1) 上
+            self.assertEqual(mock_mrpt.NEVPT.call_args.kwargs.get("root"), 1)
+            self.assertAlmostEqual(e, -1.05 - 0.02)
+
+    def test_custom_state_weights(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, _ = self._mods()
+        mc = self._mock_mc(mock_pyscf, mock_mcscf, e_states=(-1.10, -1.0, -0.9))
+        mock_mcscf.state_average_.return_value = mc
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                   active_space=(2, 2), nstates=3, state=0,
+                                   state_average=True,
+                                   state_weights=(0.6, 0.3, 0.1))
+            calc.energy(np.array([[0., 0., 0.], [0., 0., 1.4]]))
+            w = mock_mcscf.state_average_.call_args.args[1]
+            np.testing.assert_allclose(w, [0.6, 0.3, 0.1])
+
+    def test_error_paths(self):
+        import sys
+        from unittest.mock import patch
+        mods, mock_pyscf, mock_mcscf, _ = self._mods()
+        mc = self._mock_mc(mock_pyscf, mock_mcscf)
+        mock_mcscf.state_average_.return_value = mc
+        coords = np.array([[0., 0., 0.], [0., 0., 1.4]])
+        with patch.dict(sys.modules, mods):
+            # 未开启态平均时 state=k>0 → 明确报错
+            c1 = make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                 active_space=(2, 2), state=1)
+            with self.assertRaises(CommandBackendError):
+                c1.energy(coords)
+            # 未开启态平均时 nstates>1 也**不得**隐式触发 (向后兼容)
+            c1b = make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                  active_space=(2, 2), nstates=5)
+            c1b.energy(coords)
+            mock_mcscf.state_average_.assert_not_called()
+            # state 越界
+            c2 = make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                 active_space=(2, 2), nstates=2, state=5,
+                                 state_average=True)
+            with self.assertRaises(CommandBackendError):
+                c2.energy(coords)
+            # 权重长度不匹配
+            c3 = make_calculator("pyscf", symbols=["H", "H"], method="casscf",
+                                 active_space=(2, 2), nstates=2,
+                                 state_average=True, state_weights=(1.0,))
+            with self.assertRaises(CommandBackendError):
+                c3.energy(coords)
+            # 自旋纯求解器必须被装入 (fix_spin_)
+            self.assertTrue(hasattr(mc, "fcisolver"))
+
+    def test_fd_sampling_does_not_pollute_root_tracking(self):
+        """_energy_only (FD 采样) 不得更新根跟踪参考态。"""
+        import sys
+        from unittest.mock import MagicMock, patch
+        mods, mock_pyscf = TestPySCFCalculatorMock()._get_mock_modules()
+        mock_solvent = MagicMock()
+        mock_pyscf.solvent = mock_solvent
+        mods["pyscf.solvent"] = mock_solvent
+        mock_pyscf.gto.Mole.return_value = MagicMock()
+        mf = MagicMock()
+        mf.converged = True
+        mf.e_tot = -76.0
+        td = MagicMock()
+        td.nstates = 2
+        td.kernel.return_value = (np.array([0.3, 0.5]), None)
+        td.xy = np.array([[[1.0, 0.0]], [[0.0, 1.0]]])
+        td.oscillator_strength.return_value = np.array([0.1, 0.2])
+        mock_pyscf.scf.RHF.return_value = mf
+        mock_pyscf.tdscf = MagicMock()
+        mock_pyscf.tdscf.rhf = MagicMock()
+        mock_pyscf.tdscf.rhf.TDHF.return_value = td
+        mods["pyscf.tdscf"] = mock_pyscf.tdscf
+        mods["pyscf.tdscf.rhf"] = mock_pyscf.tdscf.rhf
+
+        with patch.dict(sys.modules, mods):
+            calc = make_calculator("pyscf", symbols=["O", "H", "H"],
+                                   method="tddft", nstates=2, state=0,
+                                   follow=True)
+            coords = np.array([[0., 0., 0.], [0., 0., 1.4], [0., 1.0, -0.4]])
+            calc.energy(coords)                 # 中心点: 建立参考态
+            ref = None if calc._prev_exc_vec is None else calc._prev_exc_vec.copy()
+            self.assertIsNotNone(ref)
+            calc._energy_only(coords + 0.001)   # FD 采样
+            np.testing.assert_allclose(calc._prev_exc_vec, ref)   # 参考态未被污染
+            self.assertTrue(calc.follow)        # follow 标志已恢复
+
+
 if __name__ == "__main__":
     unittest.main()
 

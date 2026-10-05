@@ -70,6 +70,7 @@ def main():
     sample_parser.add_argument("--mom", action="store_true",
                                help="启用最大重叠法 (MOM) 沿采样序列跟踪特定激发/占据态 (pyscf)")
     _add_solvent_args(sample_parser)
+    _add_casscf_args(sample_parser)
 
     soc_parser = sub.add_parser(
         "soc", help="自旋-轨道耦合 (单电子 Breit-Pauli): ζ / 精细结构 / 单-三态耦合")
@@ -168,6 +169,45 @@ def main():
         parser.print_help()
 
 
+def _add_casscf_args(p):
+    """CASSCF/态平均参数 (sample/opt/scan/freq 共用; pyscf 后端)。"""
+    p.add_argument("--active-space", type=int, nargs=2, default=None,
+                   metavar=("NCAS", "NELECAS"),
+                   help="CASSCF 活性空间 (轨道数 电子数), 如 --active-space 4 4")
+    p.add_argument("--pt2", default=None, choices=["nevpt2"],
+                   help="CASSCF 之上的动态相关 (NEVPT2; PySCF 无 CASPT2)")
+    p.add_argument("--nstates", type=int, default=None,
+                   help="态平均态数 (>1 启用态平均 CASSCF 激发态势能面)")
+    p.add_argument("--state", type=int, default=None,
+                   help="选中的态 (0-based; 需配合 --nstates>1)")
+    p.add_argument("--state-weights", type=float, nargs="+", default=None,
+                   help="态平均权重 (缺省等权; 长度须等于 --nstates)")
+    p.add_argument("--state-average", action="store_true",
+                   help="启用态平均 CASSCF (需配合 --nstates>1; 自旋纯)")
+    p.add_argument("--follow", action="store_true",
+                   help="根跟踪 (态平均 CASSCF: 按上一几何 CI 向量最大重叠选根)")
+
+
+def _casscf_kwargs(args):
+    """从 CLI 参数提取 CASSCF kwargs (未指定时保持默认行为)。"""
+    out = {}
+    if getattr(args, "active_space", None) is not None:
+        out["active_space"] = tuple(args.active_space)
+    if getattr(args, "pt2", None):
+        out["pt2"] = args.pt2
+    if getattr(args, "state_average", False):
+        out["state_average"] = True
+    if getattr(args, "nstates", None):
+        out["nstates"] = args.nstates
+    if getattr(args, "state", None) is not None:
+        out["state"] = args.state
+    if getattr(args, "state_weights", None):
+        out["state_weights"] = tuple(args.state_weights)
+    if getattr(args, "follow", False):
+        out["follow"] = True
+    return out
+
+
 def _add_solvent_args(p):
     """隐式溶剂参数 (sample/opt/scan/freq 共用; pyscf 后端)。"""
     p.add_argument("--solvent", default=None,
@@ -208,6 +248,7 @@ def _add_calc_args(p):
     p.add_argument("--xc", default=None, help="DFT 泛函")
     p.add_argument("--frozen-core", action="store_true", help="冻结核 (MP2/CCSD)")
     _add_solvent_args(p)
+    _add_casscf_args(p)
 
 
 def _make_calc(args):
@@ -217,7 +258,8 @@ def _make_calc(args):
         return symbols, coords, make_calculator(
             "pyscf", symbols=symbols, basis=args.basis, charge=args.charge,
             spin=args.spin, method=args.method, xc=args.xc,
-            frozen_core=args.frozen_core, **_solvent_kwargs(args))
+            frozen_core=args.frozen_core, **_solvent_kwargs(args),
+            **_casscf_kwargs(args))
     return symbols, coords, make_calculator(args.backend, symbols=symbols)
 
 
@@ -323,6 +365,7 @@ def _sample_data(args):
                 "use_mom": args.mom,
             })
             kwargs.update(_solvent_kwargs(args))
+            kwargs.update(_casscf_kwargs(args))
     calc = make_calculator(args.backend, symbols=symbols, **kwargs)
     print(f"后端: {calc.name} {calc.provenance}")
 
